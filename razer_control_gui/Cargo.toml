@@ -21,6 +21,10 @@ path = "src/daemon/daemon.rs"
 name = "razer-settings"
 path = "src/razer-settings/razer-settings.rs"
 
+[[bin]]
+name = "razer-bho-probe"
+path = "src/probe_bho.rs"
+
 [lints.rust]
 
 [lints.clippy]

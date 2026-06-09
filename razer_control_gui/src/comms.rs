@@ -51,6 +51,7 @@ pub enum DaemonCommand {
     GetGpuStatus,
     SetDgpuRuntimePM { enabled: bool },
     SetGpuMode { mode: String },
+    ProbeBatteryHealthOptimizer,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -86,6 +87,15 @@ pub enum DaemonResponse {
     },
     SetDgpuRuntimePM { result: bool },
     SetGpuMode { result: bool, message: String },
+    Unsupported { feature: String, device: String },
+    ProbeBatteryHealthOptimizer {
+        device: String,
+        responded: bool,
+        status: u8,
+        raw_value: u8,
+        is_on: bool,
+        threshold: u8,
+    },
 }
 
 #[allow(dead_code)]

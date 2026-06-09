@@ -102,6 +102,7 @@ fn get_bho() -> Option<(bool, u8)> {
     use comms::DaemonResponse::*;
     match response {
         GetBatteryHealthOptimizer { is_on, threshold } => Some((is_on, threshold)),
+        Unsupported { .. } => None,
         response => {
             println!("Instead of GetBatteryHealthOptimizer got {response:?}");
             None
@@ -114,6 +115,7 @@ fn set_bho(is_on: bool, threshold: u8) -> Option<bool> {
     use comms::DaemonResponse::*;
     match response {
         SetBatteryHealthOptimizer { result } => Some(result),
+        Unsupported { .. } => Some(false),
         response => {
             println!("Instead of SetBatteryHealthOptimizer got {response:?}");
             None
@@ -859,34 +861,6 @@ fn check_first_run() -> bool {
     }
 }
 
-fn show_first_run_donation_dialog(window: &adw::ApplicationWindow) {
-    let dialog = adw::AlertDialog::builder()
-        .heading("Support Development")
-        .body(
-            "Hi! Thank you for using Razer Control.\n\n\
-            I develop this application in my free time to support the Linux community. \
-            If it helps you, please consider making a small donation.\n\n\
-            Your support helps me acquire more Razer devices for testing and verification, \
-            making the experience better for everyone!"
-        )
-        .build();
-
-    dialog.add_response("later", "Maybe Later");
-    dialog.add_response("donate", "Donate \u{2764}\u{FE0F}");
-    dialog.set_response_appearance("donate", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("donate"));
-    dialog.set_close_response("later");
-
-    dialog.connect_response(None, |_, response| {
-        if response == "donate" {
-            let _ = std::process::Command::new("xdg-open")
-                .arg("https://www.paypal.com/donate/?hosted_button_id=H4SCC24R8KS4A")
-                .spawn();
-        }
-    });
-
-    dialog.present(Some(window));
-}
 
 
 fn main() {
@@ -1052,9 +1026,6 @@ fn main() {
         window.set_content(Some(&toast_overlay));
         window.present();
 
-        if check_first_run() {
-            show_first_run_donation_dialog(&window);
-        }
     });
 
     app.run();
@@ -1135,10 +1106,33 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         min_fan_speed, max_fan_speed, 100.0,
         if auto { min_fan_speed } else { fan_speed as f64 },
     );
-    fan_slider.add_mark(min_fan_speed, Some("Min"));
-    fan_slider.add_mark(max_fan_speed, Some("Max"));
+    let fan_stages = 4;
+    let fan_stage_step = (max_fan_speed - min_fan_speed) / fan_stages as f64;
+    for i in 0..=fan_stages {
+        let rpm = ((min_fan_speed + fan_stage_step * i as f64) / 100.0).round() * 100.0;
+        let label = if i == 0 {
+            "Min".to_string()
+        } else if i == fan_stages {
+            "Max".to_string()
+        } else {
+            format!("{}%", i * 100 / fan_stages)
+        };
+        fan_slider.add_mark(rpm, Some(&label));
+    }
     fan_slider.scale.set_sensitive(!auto);
     fan_section.add_row(&fan_slider.container);
+
+    let fan_spin = gtk::SpinButton::with_range(min_fan_speed, max_fan_speed, 100.0);
+    fan_spin.set_value(if auto { min_fan_speed } else { fan_speed as f64 });
+    fan_spin.set_sensitive(!auto);
+    fan_spin.set_valign(gtk::Align::Center);
+    let fan_spin_row = adw::ActionRow::new();
+    fan_spin_row.set_title("Exact RPM");
+    fan_spin_row.set_subtitle("Type or scroll to fine-tune");
+    fan_spin_row.add_suffix(&fan_spin);
+    fan_section.add_row(&fan_spin_row);
+
+    let fan_syncing = Rc::new(Cell::new(false));
 
     // --- Callbacks ---
 
@@ -1151,6 +1145,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         let gpu_combo = gpu_combo.clone();
         let fan_switch = fan_switch.clone();
         let fan_scale = fan_slider.scale.clone();
+        let fan_spin = fan_spin.clone();
         let min_fan = min_fan_speed;
         move || {
             refreshing.set(true);
@@ -1168,10 +1163,13 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             let auto = fs == 0;
             fan_switch.set_active(auto);
             fan_scale.set_sensitive(!auto);
+            fan_spin.set_sensitive(!auto);
             if !auto {
                 fan_scale.set_value(fs as f64);
+                fan_spin.set_value(fs as f64);
             } else {
                 fan_scale.set_value(min_fan);
+                fan_spin.set_value(min_fan);
             }
             refreshing.set(false);
         }
@@ -1267,10 +1265,33 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         let is_ac = is_ac.clone();
         let refreshing = refreshing.clone();
         let fan_switch_ref = fan_switch.clone();
+        let fan_spin_ref = fan_spin.clone();
+        let fan_syncing_ref = fan_syncing.clone();
         fan_slider.scale.connect_value_changed(move |sc| {
-            if refreshing.get() { return; }
+            if refreshing.get() || fan_syncing_ref.get() { return; }
             let ac = is_ac.get();
             let value = sc.value();
+            fan_syncing_ref.set(true);
+            fan_spin_ref.set_value(value);
+            fan_syncing_ref.set(false);
+            set_fan_speed(ac, value as i32);
+            fan_switch_ref.set_active(false);
+        });
+    }
+
+    {
+        let is_ac = is_ac.clone();
+        let refreshing = refreshing.clone();
+        let fan_switch_ref = fan_switch.clone();
+        let fan_scale_ref = fan_slider.scale.clone();
+        let fan_syncing_ref = fan_syncing.clone();
+        fan_spin.connect_value_changed(move |sp| {
+            if refreshing.get() || fan_syncing_ref.get() { return; }
+            let ac = is_ac.get();
+            let value = sp.value();
+            fan_syncing_ref.set(true);
+            fan_scale_ref.set_value(value);
+            fan_syncing_ref.set(false);
             set_fan_speed(ac, value as i32);
             fan_switch_ref.set_active(false);
         });
@@ -1280,8 +1301,10 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         let is_ac = is_ac.clone();
         let refreshing_ref = refreshing.clone();
         let scale_ref = fan_slider.scale.clone();
+        let fan_spin_ref = fan_spin.clone();
         fan_switch.connect_active_notify(glib::clone!(
             #[weak] scale_ref,
+            #[weak] fan_spin_ref,
             move |sw| {
                 if refreshing_ref.get() { return; }
                 let ac = is_ac.get();
@@ -1291,8 +1314,10 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
                 } else {
                     set_fan_speed(ac, min_fan_speed as i32);
                     scale_ref.set_value(min_fan_speed);
+                    fan_spin_ref.set_value(min_fan_speed);
                 }
                 scale_ref.set_sensitive(!state);
+                fan_spin_ref.set_sensitive(!state);
             }
         ));
     }
@@ -1834,7 +1859,7 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     // Application Info Section
     let section = page.add_section(Some("Application"));
 
-    let app_name = gtk::Label::new(Some("Razer Control (Revived)"));
+    let app_name = gtk::Label::new(Some("Razer Control"));
     app_name.add_css_class("title-2");
     let row = SettingsRow::new("Name", &app_name);
     section.add_row(&row.row);
@@ -1916,14 +1941,12 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     let section = page.add_section(Some("Device Information"));
 
     let name_label = gtk::Label::new(Some(&device.name));
-    name_label.set_wrap(true);
     let row = SettingsRow::new("Model", &name_label);
     row.set_subtitle("Detected Razer laptop model");
     section.add_row(&row.row);
 
     let features = device.features.join(", ");
     let features_label = gtk::Label::new(Some(&features));
-    features_label.set_wrap(true);
     let row = SettingsRow::new("Features", &features_label);
     row.set_subtitle("Supported hardware capabilities");
     section.add_row(&row.row);
@@ -1935,34 +1958,6 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     let row = SettingsRow::new("Fan Range", &fan_label);
     row.set_subtitle("Minimum to maximum fan speed");
     section.add_row(&row.row);
-
-    // Support Section
-    let section = page.add_section(Some("Support Development"));
-
-    let support_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    support_box.set_margin_top(12);
-    support_box.set_margin_bottom(12);
-    support_box.set_margin_start(12);
-    support_box.set_margin_end(12);
-
-    let support_desc = gtk::Label::new(Some(
-        "If you find this project useful, consider supporting development.\n\
-        Your contribution helps add support for more Razer laptop models!"
-    ));
-    support_desc.set_wrap(true);
-    support_desc.set_justify(gtk::Justification::Center);
-    support_desc.add_css_class("dim-label");
-    support_box.append(&support_desc);
-
-    let donate_button = gtk::Button::with_label("Donate via PayPal");
-    donate_button.add_css_class("suggested-action");
-    donate_button.connect_clicked(|_| {
-        let _ = std::process::Command::new("xdg-open")
-            .arg("https://www.paypal.com/donate/?hosted_button_id=H4SCC24R8KS4A")
-            .spawn();
-    });
-    support_box.append(&donate_button);
-    section.add_row(&support_box);
 
     // About Section
     let section = page.add_section(Some("About"));

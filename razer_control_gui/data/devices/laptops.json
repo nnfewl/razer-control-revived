@@ -94,7 +94,7 @@
         "name": "Blade 15 2020 Advanced",
         "vid": "1532",
         "pid": "0253",
-        "features": ["logo", "creator_mode", "boost"],
+        "features": ["logo", "creator_mode", "boost", "fan"],
         "fan": [3500, 5300]
     },
     {

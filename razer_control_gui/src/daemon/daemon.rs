@@ -351,6 +351,13 @@ fn handle_data(mut stream: UnixStream) {
     }
 }
 
+fn unsupported_feature(feature: &str, d: &device::DeviceManager) -> comms::DaemonResponse {
+    comms::DaemonResponse::Unsupported {
+        feature: feature.to_string(),
+        device: d.device_name(),
+    }
+}
+
 pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     // GPU commands don't need DEV_MANAGER, handle them first
     match &cmd {
@@ -499,15 +506,37 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 Some(comms::DaemonResponse::SetStandardEffect{result: res})
             }
             comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold } => { 
+                if !d.device_has_feature("bho") {
+                    return Some(unsupported_feature("Battery Health Optimizer", &d));
+                }
                 return Some(comms::DaemonResponse::SetBatteryHealthOptimizer { result: d.set_bho_handler(is_on, threshold)});
             }
             comms::DaemonCommand::GetBatteryHealthOptimizer() => {
+                if !d.device_has_feature("bho") {
+                    return Some(unsupported_feature("Battery Health Optimizer", &d));
+                }
                 return d.get_bho_handler().map(|result| 
                     comms::DaemonResponse::GetBatteryHealthOptimizer {
                         is_on: (result.0), 
                         threshold: (result.1) 
                     }
                 );
+            }
+            comms::DaemonCommand::ProbeBatteryHealthOptimizer => {
+                let device = d.device_name();
+                let (responded, status, raw_value, is_on, threshold) = d
+                    .probe_bho_handler()
+                    .map_or((false, 0, 0, false, 0), |(status, raw_value, is_on, threshold)| {
+                        (true, status, raw_value, is_on, threshold)
+                    });
+                return Some(comms::DaemonResponse::ProbeBatteryHealthOptimizer {
+                    device,
+                    responded,
+                    status,
+                    raw_value,
+                    is_on,
+                    threshold,
+                });
             }
             comms::DaemonCommand::GetActualFanRpm => {
                 Some(comms::DaemonResponse::GetActualFanRpm { rpm: d.get_actual_fan_rpm() })
@@ -533,5 +562,3 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
         return None;
     }
 }
-
-

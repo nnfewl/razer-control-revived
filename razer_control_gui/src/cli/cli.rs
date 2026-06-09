@@ -21,6 +21,11 @@ enum Args {
         #[command(subcommand)]
         attr: WriteAttr,
     },
+    /// Probe experimental device capabilities without changing settings
+    Probe {
+        #[command(subcommand)]
+        attr: ProbeAttr,
+    },
     /// Write a standard effect
     StandardEffect {
         #[command(subcommand)]
@@ -83,6 +88,12 @@ enum WriteAttr {
     RuntimePm(RuntimePmParams),
     /// Set GPU mode via envycontrol (hybrid, integrated, nvidia)
     GpuMode(GpuModeParams),
+}
+
+#[derive(Subcommand)]
+enum ProbeAttr {
+    /// Send the known read-only BHO query even if the model does not advertise BHO
+    Bho,
 }
 
 #[derive(Parser)]
@@ -345,6 +356,9 @@ fn main() {
                 write_gpu_mode(&mode)
             }
         },
+        Args::Probe { attr } => match attr {
+            ProbeAttr::Bho => probe_bho(),
+        },
         Args::Effect { effect } => match effect {
             Effect::Static(params) => send_effect(
                 "static".to_string(),
@@ -451,17 +465,25 @@ fn read_bho() {
     send_data(comms::DaemonCommand::GetBatteryHealthOptimizer()).map_or_else(
         || eprintln!("Unknown error occured when getting bho"),
         |result| {
-            if let comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold } = result {
-                match is_on {
-                    true => {
-                        println!(
-                            "Battery health optimization is on with a threshold of {}",
-                            threshold
-                        );
+            match result {
+                comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold } => {
+                    match is_on {
+                        true => {
+                            println!(
+                                "Battery health optimization is on with a threshold of {}",
+                                threshold
+                            );
+                        }
+                        false => {
+                            eprintln!("Battery health optimization is off");
+                        }
                     }
-                    false => {
-                        eprintln!("Battery health optimization is off");
-                    }
+                }
+                comms::DaemonResponse::Unsupported { feature, device } => {
+                    print_unsupported(&feature, &device);
+                }
+                response => {
+                    eprintln!("Unexpected daemon response when getting bho: {:?}", response);
                 }
             }
         },
@@ -490,17 +512,25 @@ fn bho_toggle_on(threshold: u8) {
     .map_or_else(
         || eprintln!("Unknown error occured when toggling bho"),
         |result| {
-            if let comms::DaemonResponse::SetBatteryHealthOptimizer { result } = result {
-                match result {
-                    true => {
-                        println!(
-                            "Battery health optimization is on with a threshold of {}",
-                            threshold
-                        );
+            match result {
+                comms::DaemonResponse::SetBatteryHealthOptimizer { result } => {
+                    match result {
+                        true => {
+                            println!(
+                                "Battery health optimization is on with a threshold of {}",
+                                threshold
+                            );
+                        }
+                        false => {
+                            eprintln!("Failed to turn on bho with threshold of {}", threshold);
+                        }
                     }
-                    false => {
-                        eprintln!("Failed to turn on bho with threshold of {}", threshold);
-                    }
+                }
+                comms::DaemonResponse::Unsupported { feature, device } => {
+                    print_unsupported(&feature, &device);
+                }
+                response => {
+                    eprintln!("Unexpected daemon response when toggling bho: {:?}", response);
                 }
             }
         },
@@ -527,18 +557,96 @@ fn bho_toggle_off() {
     .map_or_else(
         || eprintln!("Unknown error occured when toggling bho"),
         |result| {
-            if let comms::DaemonResponse::SetBatteryHealthOptimizer { result } = result {
-                match result {
-                    true => {
-                        println!("Successfully turned off bho");
+            match result {
+                comms::DaemonResponse::SetBatteryHealthOptimizer { result } => {
+                    match result {
+                        true => {
+                            println!("Successfully turned off bho");
+                        }
+                        false => {
+                            eprintln!("Failed to turn off bho");
+                        }
                     }
-                    false => {
-                        eprintln!("Failed to turn off bho");
-                    }
+                }
+                comms::DaemonResponse::Unsupported { feature, device } => {
+                    print_unsupported(&feature, &device);
+                }
+                response => {
+                    eprintln!("Unexpected daemon response when toggling bho: {:?}", response);
                 }
             }
         },
     );
+}
+
+fn print_unsupported(feature: &str, device: &str) {
+    if device == "Unknown Device" {
+        eprintln!("{feature} is not supported because no supported Razer laptop is connected");
+    } else {
+        eprintln!("{feature} is not supported on {device}");
+    }
+}
+
+fn probe_bho() {
+    match send_data(comms::DaemonCommand::ProbeBatteryHealthOptimizer) {
+        Some(comms::DaemonResponse::ProbeBatteryHealthOptimizer {
+            device,
+            responded,
+            status,
+            raw_value,
+            is_on,
+            threshold,
+        }) => {
+            println!("Device: {}", device);
+            println!("Probe: BHO read command class 0x07, command 0x92");
+
+            if !responded {
+                println!("Result: no response");
+                println!("Interpretation: known BHO read command did not get a usable reply.");
+                return;
+            }
+
+            println!("Status: 0x{:02x} ({})", status, razer_status_name(status));
+            println!("Raw value: 0x{:02x}", raw_value);
+            println!(
+                "Decoded value: {}, threshold {}",
+                if is_on { "on" } else { "off" },
+                threshold
+            );
+
+            match status {
+                0x02 => {
+                    println!("Interpretation: known BHO read command appears supported.");
+                    println!("Next step: test a guarded write/read-back on this model.");
+                }
+                0x05 => {
+                    println!("Interpretation: firmware reported that this command is not supported.");
+                    println!("Next step: capture Synapse traffic if Windows exposes charge limiting.");
+                }
+                _ => {
+                    println!("Interpretation: device responded, but not with success.");
+                    println!("Next step: do not enable writes until we understand this status.");
+                }
+            }
+        }
+        Some(comms::DaemonResponse::Unsupported { feature, device }) => {
+            print_unsupported(&feature, &device);
+        }
+        Some(response) => eprintln!("Unexpected daemon response when probing bho: {:?}", response),
+        None => eprintln!("Unknown error occured when probing bho"),
+    }
+}
+
+fn razer_status_name(status: u8) -> &'static str {
+    match status {
+        0x00 => "new/no status",
+        0x01 => "busy",
+        0x02 => "successful",
+        0x03 => "failure",
+        0x04 => "timeout",
+        0x05 => "not supported",
+        _ => "unknown",
+    }
 }
 
 fn send_standard_effect(name: String, params: Vec<u8>) {

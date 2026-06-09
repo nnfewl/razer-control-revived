@@ -261,6 +261,12 @@ impl DeviceManager {
         self.device.as_ref().map_or(false, |d| d.features.contains(&feature.to_string()))
     }
 
+    pub fn device_name(&self) -> String {
+        self.device
+            .as_ref()
+            .map_or_else(|| "Unknown Device".to_string(), |d| d.get_name())
+    }
+
     pub fn restore_standard_effect(&mut self) {
         let mut effect = 0;
         let mut params: Vec<u8> = vec![];
@@ -578,6 +584,10 @@ impl DeviceManager {
             return Some((config.bho_on, config.bho_threshold));
         }
         return None;
+    }
+
+    pub fn probe_bho_handler(&mut self) -> Option<(u8, u8, bool, u8)> {
+        self.get_device().and_then(|laptop| laptop.probe_bho())
     }
 
     pub fn restore_bho(&mut self) {
@@ -1132,6 +1142,17 @@ impl RazerLaptop {
             .map(|resp| resp.args[0]);
     }
 
+    pub fn probe_bho(&mut self) -> Option<(u8, u8, bool, u8)> {
+        let mut report: RazerPacket = RazerPacket::new(0x07, 0x92, 0x01);
+        report.args[0] = 0x00;
+
+        self.send_report_probe(report).map(|resp| {
+            let raw_value = resp.args[0];
+            let (is_on, threshold) = byte_to_bho(raw_value);
+            (resp.status, raw_value, is_on, threshold)
+        })
+    }
+
     pub fn set_bho(&mut self, is_on: bool, threshold: u8) -> bool {
         if !self.have_feature("bho".to_string()) {
             return false;
@@ -1146,6 +1167,53 @@ impl RazerLaptop {
                 true
             } 
         );
+    }
+
+    fn send_report_probe(&mut self, mut report: RazerPacket) -> Option<RazerPacket> {
+        let mut temp_buf: [u8; 91] = [0x00; 91];
+        for _ in 0..3 {
+            match self.device.send_feature_report(report.calc_crc().as_slice()) {
+                Ok(_) => {
+                    thread::sleep(time::Duration::from_micros(1000));
+                    match self.device.get_feature_report(&mut temp_buf) {
+                        Ok(size) => {
+                            if size == 91 {
+                                match bincode::deserialize::<RazerPacket>(&temp_buf) {
+                                    Ok(response) => {
+                                        if response.command_id == 0x92 {
+                                            return Some(response);
+                                        }
+
+                                        if response.remaining_packets == report.remaining_packets
+                                            && response.command_class == report.command_class
+                                            && response.command_id == report.command_id
+                                        {
+                                            return Some(response);
+                                        }
+
+                                        eprintln!("Probe response doesn't match request");
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Error: {}", e);
+                                    }
+                                }
+                            } else {
+                                eprintln!("Invalid report length: {:?}", size);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
+            };
+        }
+
+        thread::sleep(time::Duration::from_micros(8000));
+        return None;
     }
 
     fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket>{
