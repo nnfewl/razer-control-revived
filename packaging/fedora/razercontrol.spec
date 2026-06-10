@@ -1,5 +1,5 @@
 Name:           razercontrol-revived
-Version:        0.3.0~rc5
+Version:        0.3.0~rc6
 Release:        1%{?dist}
 Summary:        Razer Laptop Control - Revived
 

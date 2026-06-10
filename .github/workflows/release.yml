@@ -8,7 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  APP_VERSION: "0.3.0-rc5"
+  # Must match razer_control_gui/Cargo.toml and packaging/fedora/razercontrol.spec —
+  # bump all three together when cutting a release
+  APP_VERSION: "0.3.0-rc6"
 
 jobs:
   build-rpm:
