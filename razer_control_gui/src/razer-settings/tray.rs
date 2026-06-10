@@ -2,7 +2,7 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use serde_json;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct SensorState {
     pub cpu_temp: Option<f64>,
     pub igpu_temp: Option<f64>,
@@ -20,6 +20,8 @@ pub struct SensorState {
     pub dgpu_util: Option<u32>,
     pub fan_min: i32,
     pub fan_max: i32,
+    pub logo_state: Option<u8>,
+    pub has_logo: bool,
 }
 
 impl Default for SensorState {
@@ -31,6 +33,7 @@ impl Default for SensorState {
             cpu_util: None, igpu_power: None, igpu_util: None,
             dgpu_power: None, dgpu_util: None,
             fan_min: 3500, fan_max: 5000,
+            logo_state: None, has_logo: false,
         }
     }
 }
@@ -55,6 +58,8 @@ impl SensorState {
             dgpu_util: read_dgpu_util(),
             fan_min: 3500,
             fan_max: 5000,
+            logo_state: None,
+            has_logo: false,
         }
     }
 
@@ -156,29 +161,34 @@ pub fn new_shared_state() -> SharedSensorState {
 pub fn start_background_polling(
     state: SharedSensorState,
     on_update: impl Fn() + Send + 'static,
-) -> std::sync::mpsc::Receiver<SensorState> {
-    let (sender, receiver) = std::sync::mpsc::channel();
+) {
     std::thread::spawn(move || {
         // Retry until daemon responds (connection may not be ready at app launch)
-        let (fan_min, fan_max) = loop {
-            match try_get_fan_range_from_daemon() {
-                Some(range) => break range,
+        let (fan_min, fan_max, has_logo) = loop {
+            match try_get_device_info_from_daemon() {
+                Some(info) => break info,
                 None => std::thread::sleep(std::time::Duration::from_secs(2)),
             }
         };
         if let Ok(mut s) = state.lock() {
             s.fan_min = fan_min;
             s.fan_max = fan_max;
+            s.has_logo = has_logo;
         }
 
         let mut prev_fan_speed: Option<i32> = None;
+        let mut prev_logo_state: Option<u8> = None;
+        let mut prev_on_ac: Option<bool> = None;
         loop {
             let fresh = SensorState::read_fresh();
+            let on_ac = fresh.on_ac;
             let ac = fresh.on_ac.unwrap_or(true);
+            let ac_idx = if ac { 1 } else { 0 };
+
             let fan_speed = crate::comms::try_bind()
                 .ok()
                 .and_then(|socket| crate::comms::send_to_daemon(
-                    crate::comms::DaemonCommand::GetFanSpeed { ac: if ac { 1 } else { 0 } },
+                    crate::comms::DaemonCommand::GetFanSpeed { ac: ac_idx },
                     socket,
                 ))
                 .and_then(|resp| match resp {
@@ -186,28 +196,44 @@ pub fn start_background_polling(
                     _ => None,
                 });
 
+            let logo_state = if has_logo {
+                crate::comms::try_bind()
+                    .ok()
+                    .and_then(|socket| crate::comms::send_to_daemon(
+                        crate::comms::DaemonCommand::GetLogoLedState { ac: ac_idx },
+                        socket,
+                    ))
+                    .and_then(|resp| match resp {
+                        crate::comms::DaemonResponse::GetLogoLedState { logo_state } => Some(logo_state),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+
             if let Ok(mut s) = state.lock() {
                 let (fan_min, fan_max) = (s.fan_min, s.fan_max);
-                *s = SensorState { fan_speed, fan_min, fan_max, ..fresh };
-                let _ = sender.send(s.clone());
+                *s = SensorState { fan_speed, fan_min, fan_max, has_logo, logo_state, ..fresh };
             }
 
-            // Only poke the tray host when fan speed changes — sending an update
-            // every poll cycle causes KDE to close/reset the submenu while the user
-            // is trying to interact with it.
-            if fan_speed != prev_fan_speed {
+            // Only poke the tray host when something interactive changes — sending an
+            // update every poll cycle causes KDE to close/reset the submenu while the
+            // user is trying to interact with it. AC transitions count: the per-profile
+            // fan/logo values shown in the menu depend on the active power profile.
+            if fan_speed != prev_fan_speed || logo_state != prev_logo_state || on_ac != prev_on_ac {
                 prev_fan_speed = fan_speed;
+                prev_logo_state = logo_state;
+                prev_on_ac = on_ac;
                 on_update();
             }
 
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
-    receiver
 }
 
-/// Returns `None` if the daemon is not reachable, `Some((min,max))` on success.
-fn try_get_fan_range_from_daemon() -> Option<(i32, i32)> {
+/// Returns `None` if the daemon is not reachable, `Some((fan_min, fan_max, has_logo))` on success.
+fn try_get_device_info_from_daemon() -> Option<(i32, i32, bool)> {
     let name = crate::comms::try_bind()
         .ok()
         .and_then(|socket| crate::comms::send_to_daemon(
@@ -223,16 +249,22 @@ fn try_get_fan_range_from_daemon() -> Option<(i32, i32)> {
     let json = fs::read_to_string(&path).ok()?;
     let devices: Vec<serde_json::Value> = serde_json::from_str(&json).ok()?;
 
-    for device in devices {
+    for device in &devices {
         if device["name"].as_str() == Some(&name) {
-            if let Some(fan) = device["fan"].as_array() {
+            let has_logo = device["features"].as_array()
+                .map(|f| f.iter().any(|v| v.as_str() == Some("logo")))
+                .unwrap_or(false);
+            let (fan_min, fan_max) = if let Some(fan) = device["fan"].as_array() {
                 let min = fan.first().and_then(|v| v.as_i64()).unwrap_or(3500) as i32;
                 let max = fan.get(1).and_then(|v| v.as_i64()).unwrap_or(5000) as i32;
-                return Some((min, max));
-            }
+                (min, max)
+            } else {
+                (3500, 5000)
+            };
+            return Some((fan_min, fan_max, has_logo));
         }
     }
-    Some((3500, 5000)) // device found but no fan range — use defaults
+    Some((3500, 5000, false)) // device found but no entry — use defaults
 }
 
 pub struct RazerTray {
@@ -282,7 +314,6 @@ impl ksni::Tray for RazerTray {
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let state = self.state.lock().ok().map(|s| s.clone()).unwrap_or_default();
         let current_rpm = state.fan_speed.unwrap_or(0);
-        let on_ac = state.on_ac.unwrap_or(true);
         let fan_min = state.fan_min;
         let fan_max = state.fan_max;
         let range = fan_max - fan_min;
@@ -341,6 +372,16 @@ impl ksni::Tray for RazerTray {
             _ => None,
         };
 
+        let logo_state = state.logo_state;
+        let has_logo = state.has_logo;
+        const LOGO_LABELS: [&str; 3] = ["Off", "On", "Breathing"];
+        let logo_submenu_label = {
+            let label = logo_state
+                .and_then(|s| LOGO_LABELS.get(s as usize).copied())
+                .unwrap_or("On");
+            format!("Logo  ·  {}", label)
+        };
+
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             // Primary action — first
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
@@ -366,6 +407,9 @@ impl ksni::Tray for RazerTray {
                         label: display,
                         checked: selected == Some(i),
                         activate: Box::new(move |tray: &mut RazerTray| {
+                            // Read AC state at click time — the menu snapshot can be stale
+                            // (ksni only rebuilds it on handle.update(), not on open)
+                            let on_ac = tray.state.lock().ok().and_then(|s| s.on_ac).unwrap_or(true);
                             let ac = if on_ac { 1 } else { 0 };
                             let _ = crate::comms::try_bind()
                                 .ok()
@@ -382,8 +426,40 @@ impl ksni::Tray for RazerTray {
                 }).collect(),
                 ..Default::default()
             }),
-            ksni::MenuItem::Separator,
         ];
+
+        // Logo submenu — only shown on devices with logo feature
+        if has_logo {
+            items.push(ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
+                label: logo_submenu_label,
+                submenu: LOGO_LABELS.iter().enumerate().map(|(i, label)| {
+                    let logo_mode = i as u8;
+                    ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
+                        label: label.to_string(),
+                        checked: logo_state == Some(logo_mode),
+                        activate: Box::new(move |tray: &mut RazerTray| {
+                            // Read AC state at click time — the menu snapshot can be stale
+                            // (ksni only rebuilds it on handle.update(), not on open)
+                            let on_ac = tray.state.lock().ok().and_then(|s| s.on_ac).unwrap_or(true);
+                            let ac = if on_ac { 1 } else { 0 };
+                            let _ = crate::comms::try_bind()
+                                .ok()
+                                .and_then(|socket| crate::comms::send_to_daemon(
+                                    crate::comms::DaemonCommand::SetLogoLedState { ac, logo_state: logo_mode },
+                                    socket,
+                                ));
+                            if let Ok(mut s) = tray.state.lock() {
+                                s.logo_state = Some(logo_mode);
+                            }
+                        }),
+                        ..Default::default()
+                    })
+                }).collect(),
+                ..Default::default()
+            }));
+        }
+
+        items.push(ksni::MenuItem::Separator);
 
         // Status section
         for line in [cpu_line, igpu_line, dgpu_line, bat_line].into_iter().flatten() {

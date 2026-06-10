@@ -608,7 +608,7 @@ fn get_cpu_utilization() -> Option<u32> {
 }
 
 /// Create system monitor panel at the bottom (widget-style layout)
-fn create_system_monitor(sensor_rx: Option<std::sync::mpsc::Receiver<tray::SensorState>>) -> gtk::Box {
+fn create_system_monitor(sensor_state: tray::SharedSensorState) -> gtk::Box {
     let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     main_box.set_margin_start(16);
     main_box.set_margin_end(16);
@@ -822,21 +822,17 @@ fn create_system_monitor(sensor_rx: Option<std::sync::mpsc::Receiver<tray::Senso
         }
     };
 
-    if let Some(rx) = sensor_rx {
-        glib::timeout_add_local(Duration::from_millis(200), move || {
-            let mut latest = None;
-            loop {
-                match rx.try_recv() {
-                    Ok(s) => latest = Some(s),
-                    Err(_) => break,
-                }
+    let mut last_rendered: Option<tray::SensorState> = None;
+    glib::timeout_add_local(Duration::from_millis(200), move || {
+        let snapshot = sensor_state.lock().ok().map(|s| s.clone());
+        if let Some(s) = snapshot {
+            if last_rendered.as_ref() != Some(&s) {
+                update_fn(s.clone());
+                last_rendered = Some(s);
             }
-            if let Some(state) = latest {
-                update_fn(state);
-            }
-            glib::ControlFlow::Continue
-        });
-    }
+        }
+        glib::ControlFlow::Continue
+    });
 
     main_box
 }
@@ -871,12 +867,8 @@ fn main() {
     // Keep the app alive even when the window is hidden (close-to-tray)
     let _hold_guard = app.hold();
 
-    // Channel receiver shared between connect_startup (producer) and connect_activate (consumer)
-    let sensor_rx_slot: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<tray::SensorState>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
-
     // Spawn tray only on primary instance (inside connect_startup)
     let tray_state = Arc::clone(&shared_state);
-    let sensor_rx_slot_startup = Arc::clone(&sensor_rx_slot);
     app.connect_startup(move |_| {
         adw::init().ok();
 
@@ -907,16 +899,13 @@ fn main() {
             }
         };
 
-        // Background sensor polling — push updates via channel to monitor bar,
-        // and call on_update() after each poll so the tray host re-fetches the menu
-        let sensor_rx = tray::start_background_polling(Arc::clone(&tray_state), on_update);
-        if let Ok(mut slot) = sensor_rx_slot_startup.lock() {
-            *slot = Some(sensor_rx);
-        }
+        // Background sensor polling — writes into the shared state read by both the
+        // tray tooltip and the monitor bar, and calls on_update() when something
+        // interactive changes so the tray host re-fetches the menu
+        tray::start_background_polling(Arc::clone(&tray_state), on_update);
     });
 
     let shared_state_for_activate = Arc::clone(&shared_state);
-    let sensor_rx_slot_activate = Arc::clone(&sensor_rx_slot);
     app.connect_activate(move |app| {
         // If a window already exists (even if hidden), show it
         let windows = app.windows();
@@ -1029,8 +1018,7 @@ fn main() {
 
         let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
         content_box.append(&separator);
-        let sensor_rx = sensor_rx_slot_activate.lock().ok().and_then(|mut s| s.take());
-        let monitor = create_system_monitor(sensor_rx);
+        let monitor = create_system_monitor(Arc::clone(&shared_state_for_activate));
         content_box.append(&monitor);
 
         let toast_overlay = adw::ToastOverlay::new();
