@@ -285,13 +285,17 @@ impl ksni::Tray for RazerTray {
         let fan_max = state.fan_max;
         let range = fan_max - fan_min;
 
+        // Round to nearest 100 to match slider marks in the app
+        let pct_rpm = |p: f64| -> i32 {
+            ((fan_min as f64 + range as f64 * p) / 100.0).round() as i32 * 100
+        };
         let presets: [(i32, &str); 6] = [
-            (0,                        "Auto"),
-            (fan_min,                  "Min"),
-            (fan_min + range / 4,      "25%"),
-            (fan_min + range / 2,      "50%"),
-            (fan_min + range * 3 / 4,  "75%"),
-            (fan_max,                  "Max"),
+            (0,               "Auto"),
+            (fan_min,         "Min"),
+            (pct_rpm(0.25),   "25%"),
+            (pct_rpm(0.50),   "50%"),
+            (pct_rpm(0.75),   "75%"),
+            (fan_max,         "Max"),
         ];
 
         let selected = presets.iter().enumerate()
