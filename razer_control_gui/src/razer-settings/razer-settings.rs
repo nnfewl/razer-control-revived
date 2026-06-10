@@ -1091,7 +1091,8 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
 
     let fan_speed = get_fan_speed(initial_ac).unwrap_or(0);
     let min_fan_speed = *device.fan.get(0).unwrap_or(&0) as f64;
-    let max_fan_speed = *device.fan.get(1).unwrap_or(&5000) as f64;
+    let max_fan_speed = device.fan.get(1).copied()
+        .unwrap_or(service::DEFAULT_FAN_MAX as u16) as f64;
     let auto = fan_speed == 0;
 
     let fan_switch = make_switch_row(
@@ -1552,7 +1553,7 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
         let combo = make_combo_row(
             "Logo Mode",
             "Control Razer logo lighting",
-            &["Off", "On", "Breathing"],
+            &service::LOGO_LABELS,
             logo as u32,
         );
         logo_section.add_row(&combo);
@@ -1950,8 +1951,8 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     row.set_subtitle("Supported hardware capabilities");
     section.add_row(&row.row);
 
-    let fan_min = device.fan.get(0).unwrap_or(&0);
-    let fan_max = device.fan.get(1).unwrap_or(&5000);
+    let fan_min = device.fan.get(0).copied().unwrap_or(0);
+    let fan_max = device.fan.get(1).copied().unwrap_or(service::DEFAULT_FAN_MAX as u16);
     let fan_range = format!("{} - {} RPM", fan_min, fan_max);
     let fan_label = gtk::Label::new(Some(&fan_range));
     let row = SettingsRow::new("Fan Range", &fan_label);

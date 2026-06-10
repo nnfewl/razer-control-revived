@@ -4,6 +4,13 @@ use serde::{Serialize, Deserialize};
 
 const DEVICE_FILE_DEFAULT: &str = "/usr/share/razercontrol/laptops.json";
 
+/// Logo LED states as encoded in the daemon protocol: index = logo_state value.
+pub const LOGO_LABELS: [&str; 3] = ["Off", "On", "Breathing"];
+
+/// Fallback fan range (RPM) when a device entry doesn't declare one.
+pub const DEFAULT_FAN_MIN: i32 = 3500;
+pub const DEFAULT_FAN_MAX: i32 = 5000;
+
 pub fn device_file_path() -> String {
     std::env::var("RAZER_DEVICE_FILE").unwrap_or_else(|_| DEVICE_FILE_DEFAULT.to_string())
 }

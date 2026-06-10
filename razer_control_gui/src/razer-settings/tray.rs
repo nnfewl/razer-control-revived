@@ -32,7 +32,7 @@ impl Default for SensorState {
             battery_status: None, battery_power: None, system_power: None,
             cpu_util: None, igpu_power: None, igpu_util: None,
             dgpu_power: None, dgpu_util: None,
-            fan_min: 3500, fan_max: 5000,
+            fan_min: service::DEFAULT_FAN_MIN, fan_max: service::DEFAULT_FAN_MAX,
             logo_state: None, has_logo: false,
         }
     }
@@ -57,8 +57,8 @@ impl SensorState {
             igpu_util: read_igpu_util(),
             dgpu_power,
             dgpu_util,
-            fan_min: 3500,
-            fan_max: 5000,
+            fan_min: service::DEFAULT_FAN_MIN,
+            fan_max: service::DEFAULT_FAN_MAX,
             logo_state: None,
             has_logo: false,
         }
@@ -261,7 +261,7 @@ fn try_get_device_info_from_daemon() -> Option<(i32, i32, bool)> {
             "Tray: device '{}' not found in {}; using default fan range, logo control disabled",
             name, path
         );
-        Some((3500, 5000, false))
+        Some((DEFAULT_FAN_MIN, DEFAULT_FAN_MAX, false))
     })
 }
 
@@ -279,16 +279,15 @@ fn parse_dgpu_stats(output: &str) -> (Option<f64>, Option<f64>, Option<u32>) {
     (temp, power, util)
 }
 
-/// Logo LED states as encoded in the daemon protocol: 0=Off, 1=On, 2=Breathing
-const LOGO_LABELS: [&str; 3] = ["Off", "On", "Breathing"];
+use service::{DEFAULT_FAN_MAX, DEFAULT_FAN_MIN, LOGO_LABELS};
 
 /// Fan range and logo capability for `name` from the parsed device list.
 /// `None` when the device is not in the list — the caller decides the
 /// fallback (and should log the miss).
 fn device_info(devices: &[service::SupportedDevice], name: &str) -> Option<(i32, i32, bool)> {
     let device = devices.iter().find(|d| d.name == name)?;
-    let fan_min = device.fan.first().map(|&v| v as i32).unwrap_or(3500);
-    let fan_max = device.fan.get(1).map(|&v| v as i32).unwrap_or(5000);
+    let fan_min = device.fan.first().map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MIN);
+    let fan_max = device.fan.get(1).map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MAX);
     Some((fan_min, fan_max, device.has_logo()))
 }
 

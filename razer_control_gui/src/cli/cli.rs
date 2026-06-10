@@ -715,12 +715,10 @@ fn read_actual_fan_rpm() {
 fn read_logo_mode(ac: usize) {
     match send_data(comms::DaemonCommand::GetLogoLedState { ac }) {
         Some(comms::DaemonResponse::GetLogoLedState { logo_state }) => {
-            let logo_state_desc: &str = match logo_state {
-                0 => "Off",
-                1 => "On",
-                2 => "Breathing",
-                _ => "Unknown",
-            };
+            let logo_state_desc: &str = service::LOGO_LABELS
+                .get(logo_state as usize)
+                .copied()
+                .unwrap_or("Unknown");
             println!("Current logo setting: {}", logo_state_desc);
         },
         Some(_) => eprintln!("Daemon responded with invalid data!"),
