@@ -1,6 +1,27 @@
 use std::fs;
 use std::sync::{Arc, Mutex};
 use serde_json;
+use service::{DEFAULT_FAN_MAX, DEFAULT_FAN_MIN, LOGO_LABELS};
+
+/// Static device capabilities, fetched once at startup — kept separate from
+/// the per-poll sensor readings so the poll loop preserves them as one unit
+/// and a newly added capability can't be silently reset every cycle.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DeviceCaps {
+    pub fan_min: i32,
+    pub fan_max: i32,
+    pub has_logo: bool,
+}
+
+impl Default for DeviceCaps {
+    fn default() -> Self {
+        DeviceCaps {
+            fan_min: DEFAULT_FAN_MIN,
+            fan_max: DEFAULT_FAN_MAX,
+            has_logo: false,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub struct SensorState {
@@ -18,10 +39,8 @@ pub struct SensorState {
     pub igpu_util: Option<u32>,
     pub dgpu_power: Option<f64>,
     pub dgpu_util: Option<u32>,
-    pub fan_min: i32,
-    pub fan_max: i32,
     pub logo_state: Option<u8>,
-    pub has_logo: bool,
+    pub caps: DeviceCaps,
 }
 
 impl Default for SensorState {
@@ -32,8 +51,7 @@ impl Default for SensorState {
             battery_status: None, battery_power: None, system_power: None,
             cpu_util: None, igpu_power: None, igpu_util: None,
             dgpu_power: None, dgpu_util: None,
-            fan_min: service::DEFAULT_FAN_MIN, fan_max: service::DEFAULT_FAN_MAX,
-            logo_state: None, has_logo: false,
+            logo_state: None, caps: DeviceCaps::default(),
         }
     }
 }
@@ -57,10 +75,8 @@ impl SensorState {
             igpu_util: read_igpu_util(),
             dgpu_power,
             dgpu_util,
-            fan_min: service::DEFAULT_FAN_MIN,
-            fan_max: service::DEFAULT_FAN_MAX,
             logo_state: None,
-            has_logo: false,
+            caps: DeviceCaps::default(),
         }
     }
 
@@ -165,16 +181,15 @@ pub fn start_background_polling(
 ) {
     std::thread::spawn(move || {
         // Retry until daemon responds (connection may not be ready at app launch)
-        let (fan_min, fan_max, has_logo) = loop {
+        let caps = loop {
             match try_get_device_info_from_daemon() {
-                Some(info) => break info,
+                Some(caps) => break caps,
                 None => std::thread::sleep(std::time::Duration::from_secs(2)),
             }
         };
+        let has_logo = caps.has_logo;
         if let Ok(mut s) = state.lock() {
-            s.fan_min = fan_min;
-            s.fan_max = fan_max;
-            s.has_logo = has_logo;
+            s.caps = caps;
         }
 
         let mut prev_fan_speed: Option<i32> = None;
@@ -220,8 +235,8 @@ pub fn start_background_polling(
             };
 
             if let Ok(mut s) = state.lock() {
-                let (fan_min, fan_max) = (s.fan_min, s.fan_max);
-                *s = SensorState { fan_speed, fan_min, fan_max, has_logo, logo_state, ..fresh };
+                let caps = s.caps.clone();
+                *s = SensorState { fan_speed, logo_state, caps, ..fresh };
             }
 
             // Only poke the tray host when something interactive changes — sending an
@@ -240,8 +255,8 @@ pub fn start_background_polling(
     });
 }
 
-/// Returns `None` if the daemon is not reachable, `Some((fan_min, fan_max, has_logo))` on success.
-fn try_get_device_info_from_daemon() -> Option<(i32, i32, bool)> {
+/// Returns `None` if the daemon is not reachable, the device capabilities on success.
+fn try_get_device_info_from_daemon() -> Option<DeviceCaps> {
     let name = crate::comms::try_bind()
         .ok()
         .and_then(|socket| crate::comms::send_to_daemon(
@@ -261,7 +276,7 @@ fn try_get_device_info_from_daemon() -> Option<(i32, i32, bool)> {
             "Tray: device '{}' not found in {}; using default fan range, logo control disabled",
             name, path
         );
-        Some((DEFAULT_FAN_MIN, DEFAULT_FAN_MAX, false))
+        Some(DeviceCaps::default())
     })
 }
 
@@ -279,16 +294,16 @@ fn parse_dgpu_stats(output: &str) -> (Option<f64>, Option<f64>, Option<u32>) {
     (temp, power, util)
 }
 
-use service::{DEFAULT_FAN_MAX, DEFAULT_FAN_MIN, LOGO_LABELS};
-
 /// Fan range and logo capability for `name` from the parsed device list.
 /// `None` when the device is not in the list — the caller decides the
 /// fallback (and should log the miss).
-fn device_info(devices: &[service::SupportedDevice], name: &str) -> Option<(i32, i32, bool)> {
+fn device_info(devices: &[service::SupportedDevice], name: &str) -> Option<DeviceCaps> {
     let device = devices.iter().find(|d| d.name == name)?;
-    let fan_min = device.fan.first().map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MIN);
-    let fan_max = device.fan.get(1).map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MAX);
-    Some((fan_min, fan_max, device.has_logo()))
+    Some(DeviceCaps {
+        fan_min: device.fan.first().map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MIN),
+        fan_max: device.fan.get(1).map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MAX),
+        has_logo: device.has_logo(),
+    })
 }
 
 /// One request/response round-trip; the socket protocol is one command per
@@ -409,8 +424,8 @@ impl ksni::Tray for RazerTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let state = self.state.lock().ok().map(|s| s.clone()).unwrap_or_default();
-        let fan_min = state.fan_min;
-        let fan_max = state.fan_max;
+        let fan_min = state.caps.fan_min;
+        let fan_max = state.caps.fan_max;
 
         let presets = fan_presets(fan_min, fan_max);
         let selected = selected_preset_index(&presets, state.fan_speed);
@@ -442,7 +457,7 @@ impl ksni::Tray for RazerTray {
         };
 
         let logo_state = state.logo_state;
-        let has_logo = state.has_logo;
+        let has_logo = state.caps.has_logo;
         let logo_submenu_label = format!("Logo  ·  {}", logo_label(logo_state));
 
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
@@ -793,13 +808,16 @@ mod tests {
     #[test]
     fn device_info_reads_fan_range_and_logo_feature() {
         let devices = [test_device("Blade 15", &["fan", "logo"], &[3200, 5200])];
-        assert_eq!(device_info(&devices, "Blade 15"), Some((3200, 5200, true)));
+        assert_eq!(
+            device_info(&devices, "Blade 15"),
+            Some(DeviceCaps { fan_min: 3200, fan_max: 5200, has_logo: true })
+        );
     }
 
     #[test]
     fn device_info_defaults_fan_range_when_entry_has_none() {
         let devices = [test_device("Blade 14", &["fan"], &[])];
-        assert_eq!(device_info(&devices, "Blade 14"), Some((3500, 5000, false)));
+        assert_eq!(device_info(&devices, "Blade 14"), Some(DeviceCaps::default()));
     }
 
     #[test]
