@@ -425,6 +425,10 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             }
             comms::DaemonCommand::GetSync() => Some(comms::DaemonResponse::GetSync { sync: d.get_sync() }),
             comms::DaemonCommand::GetFanSpeed{ac} if ac < 2 => Some(comms::DaemonResponse::GetFanSpeed { rpm: d.get_fan_rpm(ac)}),
+            comms::DaemonCommand::GetFanSpeedAndLogo{ac} if ac < 2 => Some(comms::DaemonResponse::GetFanSpeedAndLogo {
+                rpm: d.get_fan_rpm(ac),
+                logo_state: d.get_logo_led_state(ac),
+            }),
             comms::DaemonCommand::GetPwrLevel{ac} if ac < 2 => Some(comms::DaemonResponse::GetPwrLevel { pwr: d.get_power_mode(ac) }),
             comms::DaemonCommand::GetCPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetCPUBoost { cpu: d.get_cpu_boost(ac) }),
             comms::DaemonCommand::GetGPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetGPUBoost { gpu: d.get_gpu_boost(ac) }),

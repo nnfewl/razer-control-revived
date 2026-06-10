@@ -41,10 +41,11 @@ impl Default for SensorState {
 impl SensorState {
     /// Read all sensors directly from sysfs/nvidia-smi
     fn read_fresh() -> Self {
+        let (dgpu_temp, dgpu_power, dgpu_util) = read_dgpu_stats();
         SensorState {
             cpu_temp: read_cpu_temp(),
             igpu_temp: read_igpu_temp(),
-            dgpu_temp: read_dgpu_temp(),
+            dgpu_temp,
             fan_speed: None, // requires daemon, skip in tray
             on_ac: read_ac_power(),
             battery_pct: read_battery_pct(),
@@ -54,8 +55,8 @@ impl SensorState {
             cpu_util: read_cpu_util(),
             igpu_power: read_igpu_power(),
             igpu_util: read_igpu_util(),
-            dgpu_power: read_dgpu_power(),
-            dgpu_util: read_dgpu_util(),
+            dgpu_power,
+            dgpu_util,
             fan_min: 3500,
             fan_max: 5000,
             logo_state: None,
@@ -185,31 +186,22 @@ pub fn start_background_polling(
             let ac = fresh.on_ac.unwrap_or(true);
             let ac_idx = if ac { 1 } else { 0 };
 
-            let fan_speed = crate::comms::try_bind()
+            // One daemon round-trip for both values — the socket protocol is
+            // one command per connection
+            let status = crate::comms::try_bind()
                 .ok()
                 .and_then(|socket| crate::comms::send_to_daemon(
-                    crate::comms::DaemonCommand::GetFanSpeed { ac: ac_idx },
+                    crate::comms::DaemonCommand::GetFanSpeedAndLogo { ac: ac_idx },
                     socket,
                 ))
                 .and_then(|resp| match resp {
-                    crate::comms::DaemonResponse::GetFanSpeed { rpm } => Some(rpm),
+                    crate::comms::DaemonResponse::GetFanSpeedAndLogo { rpm, logo_state } =>
+                        Some((rpm, logo_state)),
                     _ => None,
                 });
 
-            let logo_state = if has_logo {
-                crate::comms::try_bind()
-                    .ok()
-                    .and_then(|socket| crate::comms::send_to_daemon(
-                        crate::comms::DaemonCommand::GetLogoLedState { ac: ac_idx },
-                        socket,
-                    ))
-                    .and_then(|resp| match resp {
-                        crate::comms::DaemonResponse::GetLogoLedState { logo_state } => Some(logo_state),
-                        _ => None,
-                    })
-            } else {
-                None
-            };
+            let fan_speed = status.map(|(rpm, _)| rpm);
+            let logo_state = if has_logo { status.map(|(_, logo)| logo) } else { None };
 
             if let Ok(mut s) = state.lock() {
                 let (fan_min, fan_max) = (s.fan_min, s.fan_max);
@@ -244,33 +236,53 @@ fn try_get_device_info_from_daemon() -> Option<(i32, i32, bool)> {
             _ => None,
         })?;
 
-    let path = std::env::var("RAZER_DEVICE_FILE")
-        .unwrap_or_else(|_| "/usr/share/razercontrol/laptops.json".into());
+    let path = service::device_file_path();
     let json = fs::read_to_string(&path).ok()?;
-    let devices: Vec<serde_json::Value> = serde_json::from_str(&json).ok()?;
+    let devices: Vec<service::SupportedDevice> = serde_json::from_str(&json).ok()?;
 
-    for device in &devices {
-        if device["name"].as_str() == Some(&name) {
-            let has_logo = device["features"].as_array()
-                .map(|f| f.iter().any(|v| v.as_str() == Some("logo")))
-                .unwrap_or(false);
-            let (fan_min, fan_max) = if let Some(fan) = device["fan"].as_array() {
-                let min = fan.first().and_then(|v| v.as_i64()).unwrap_or(3500) as i32;
-                let max = fan.get(1).and_then(|v| v.as_i64()).unwrap_or(5000) as i32;
-                (min, max)
-            } else {
-                (3500, 5000)
-            };
-            return Some((fan_min, fan_max, has_logo));
-        }
-    }
-    Some((3500, 5000, false)) // device found but no entry — use defaults
+    device_info(&devices, &name).or_else(|| {
+        eprintln!(
+            "Tray: device '{}' not found in {}; using default fan range, logo control disabled",
+            name, path
+        );
+        Some((3500, 5000, false))
+    })
 }
 
 // --- Pure tray-menu logic (unit-tested below) ---
 
+/// Parse one line of `nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu
+/// --format=csv,noheader,nounits` output into (temp °C, power W, util %).
+/// Fields the driver reports as "[N/A]" (e.g. while the dGPU sleeps) become None.
+fn parse_dgpu_stats(output: &str) -> (Option<f64>, Option<f64>, Option<u32>) {
+    let first_gpu = output.lines().next().unwrap_or("");
+    let mut fields = first_gpu.split(',').map(str::trim);
+    let temp = fields.next().and_then(|f| f.parse::<f64>().ok());
+    let power = fields.next().and_then(|f| f.parse::<f64>().ok());
+    let util = fields.next().and_then(|f| f.parse::<u32>().ok());
+    (temp, power, util)
+}
+
 /// Logo LED states as encoded in the daemon protocol: 0=Off, 1=On, 2=Breathing
 const LOGO_LABELS: [&str; 3] = ["Off", "On", "Breathing"];
+
+/// Fan range and logo capability for `name` from the parsed device list.
+/// `None` when the device is not in the list — the caller decides the
+/// fallback (and should log the miss).
+fn device_info(devices: &[service::SupportedDevice], name: &str) -> Option<(i32, i32, bool)> {
+    let device = devices.iter().find(|d| d.name == name)?;
+    let fan_min = device.fan.first().map(|&v| v as i32).unwrap_or(3500);
+    let fan_max = device.fan.get(1).map(|&v| v as i32).unwrap_or(5000);
+    Some((fan_min, fan_max, device.has_logo()))
+}
+
+/// True when the daemon acknowledged a Set command — the tray must not
+/// update its local state optimistically on failure (REVIEW_FINDINGS #4).
+fn set_acknowledged(resp: &crate::comms::DaemonResponse) -> bool {
+    matches!(resp,
+        crate::comms::DaemonResponse::SetFanSpeed { result: true }
+        | crate::comms::DaemonResponse::SetLogoLedState { result: true })
+}
 
 /// Five fan presets derived from the device fan range. RPMs snap to the
 /// nearest 100 to match hardware granularity (clamp_fan divides by 100).
@@ -438,14 +450,17 @@ impl ksni::Tray for RazerTray {
                             // (ksni only rebuilds it on handle.update(), not on open)
                             let on_ac = tray.state.lock().ok().and_then(|s| s.on_ac).unwrap_or(true);
                             let ac = if on_ac { 1 } else { 0 };
-                            let _ = crate::comms::try_bind()
+                            let acknowledged = crate::comms::try_bind()
                                 .ok()
                                 .and_then(|socket| crate::comms::send_to_daemon(
                                     crate::comms::DaemonCommand::SetFanSpeed { ac, rpm },
                                     socket,
-                                ));
-                            if let Ok(mut s) = tray.state.lock() {
-                                s.fan_speed = Some(rpm);
+                                ))
+                                .is_some_and(|resp| set_acknowledged(&resp));
+                            if acknowledged {
+                                if let Ok(mut s) = tray.state.lock() {
+                                    s.fan_speed = Some(rpm);
+                                }
                             }
                         }),
                         ..Default::default()
@@ -469,14 +484,17 @@ impl ksni::Tray for RazerTray {
                             // (ksni only rebuilds it on handle.update(), not on open)
                             let on_ac = tray.state.lock().ok().and_then(|s| s.on_ac).unwrap_or(true);
                             let ac = if on_ac { 1 } else { 0 };
-                            let _ = crate::comms::try_bind()
+                            let acknowledged = crate::comms::try_bind()
                                 .ok()
                                 .and_then(|socket| crate::comms::send_to_daemon(
                                     crate::comms::DaemonCommand::SetLogoLedState { ac, logo_state: logo_mode },
                                     socket,
-                                ));
-                            if let Ok(mut s) = tray.state.lock() {
-                                s.logo_state = Some(logo_mode);
+                                ))
+                                .is_some_and(|resp| set_acknowledged(&resp));
+                            if acknowledged {
+                                if let Ok(mut s) = tray.state.lock() {
+                                    s.logo_state = Some(logo_mode);
+                                }
                             }
                         }),
                         ..Default::default()
@@ -556,20 +574,24 @@ fn read_igpu_temp() -> Option<f64> {
     None
 }
 
-fn read_dgpu_temp() -> Option<f64> {
+/// Temperature, power, and utilization in a single nvidia-smi invocation —
+/// process startup dominates query time, and frequent spawns can keep the
+/// dGPU awake on Optimus laptops.
+fn read_dgpu_stats() -> (Option<f64>, Option<f64>, Option<u32>) {
     if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=temperature.gpu,power.draw,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
     {
         if output.status.success() {
             if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(t) = s.trim().parse::<f64>() {
-                    return Some(t);
-                }
+                return parse_dgpu_stats(&s);
             }
         }
     }
-    None
+    (None, None, None)
 }
 
 fn read_ac_power() -> Option<bool> {
@@ -620,38 +642,6 @@ fn read_system_power() -> Option<f64> {
                     }
                 }
                 return None;
-            }
-        }
-    }
-    None
-}
-
-fn read_dgpu_power() -> Option<f64> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=power.draw", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(p) = s.trim().parse::<f64>() {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn read_dgpu_util() -> Option<u32> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(u) = s.trim().parse::<u32>() {
-                    return Some(u);
-                }
             }
         }
     }
@@ -755,6 +745,48 @@ fn read_cpu_util() -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn test_device(name: &str, features: &[&str], fan: &[u16]) -> service::SupportedDevice {
+        service::SupportedDevice {
+            name: name.into(),
+            vid: "1532".into(),
+            pid: "0000".into(),
+            features: features.iter().map(|f| f.to_string()).collect(),
+            fan: fan.to_vec(),
+        }
+    }
+
+    #[test]
+    fn set_commands_acknowledged_only_on_true_result() {
+        use crate::comms::DaemonResponse;
+        assert!(set_acknowledged(&DaemonResponse::SetFanSpeed { result: true }));
+        assert!(set_acknowledged(&DaemonResponse::SetLogoLedState { result: true }));
+        assert!(!set_acknowledged(&DaemonResponse::SetFanSpeed { result: false }));
+        assert!(!set_acknowledged(&DaemonResponse::SetLogoLedState { result: false }));
+        // unexpected response variant is not an ack
+        assert!(!set_acknowledged(&DaemonResponse::GetFanSpeed { rpm: 0 }));
+    }
+
+    #[test]
+    fn device_info_reads_fan_range_and_logo_feature() {
+        let devices = [test_device("Blade 15", &["fan", "logo"], &[3200, 5200])];
+        assert_eq!(device_info(&devices, "Blade 15"), Some((3200, 5200, true)));
+    }
+
+    #[test]
+    fn device_info_defaults_fan_range_when_entry_has_none() {
+        let devices = [test_device("Blade 14", &["fan"], &[])];
+        assert_eq!(device_info(&devices, "Blade 14"), Some((3500, 5000, false)));
+    }
+
+    #[test]
+    fn device_info_is_none_when_device_not_in_list() {
+        // Caller must be able to tell "unknown device" from "no fan data",
+        // so it can log the mismatch (REVIEW_FINDINGS #1)
+        let devices = [test_device("Blade 15", &["fan"], &[3200, 5200])];
+        assert_eq!(device_info(&devices, "Blade 18"), None);
+        assert_eq!(device_info(&[], "Blade 18"), None);
+    }
+
     #[test]
     fn presets_for_default_range() {
         let p = fan_presets(3500, 5000);
@@ -824,6 +856,31 @@ mod tests {
     fn fan_label_negative_rpm_reads_auto() {
         let p = fan_presets(3500, 5000);
         assert_eq!(fan_current_label(&p, None, Some(-1), 3500, 5000), "Auto");
+    }
+
+    #[test]
+    fn parses_combined_nvidia_smi_output() {
+        assert_eq!(parse_dgpu_stats("65, 35.50, 12\n"), (Some(65.0), Some(35.5), Some(12)));
+    }
+
+    #[test]
+    fn dgpu_fields_reported_as_not_available_become_none() {
+        // nvidia-smi emits "[N/A]" per field, e.g. while the dGPU is asleep
+        assert_eq!(parse_dgpu_stats("65, [N/A], [N/A]\n"), (Some(65.0), None, None));
+    }
+
+    #[test]
+    fn garbage_or_empty_dgpu_output_yields_all_none() {
+        assert_eq!(parse_dgpu_stats(""), (None, None, None));
+        assert_eq!(parse_dgpu_stats("NVIDIA-SMI has failed\n"), (None, None, None));
+    }
+
+    #[test]
+    fn multi_gpu_output_uses_first_gpu() {
+        assert_eq!(
+            parse_dgpu_stats("65, 35.50, 12\n48, 10.00, 3\n"),
+            (Some(65.0), Some(35.5), Some(12))
+        );
     }
 
     #[test]

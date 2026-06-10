@@ -15,7 +15,7 @@ pub fn socket_path() -> String {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct GpuInfo {
     pub name: String,
     pub pci_slot: String,
@@ -24,8 +24,12 @@ pub struct GpuInfo {
     pub runtime_status: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 /// Represents data sent TO the daemon
+///
+/// New variants must be appended at the END — bincode encodes the variant
+/// index, so inserting in the middle breaks every client/daemon pair that
+/// is not updated in lockstep.
 pub enum DaemonCommand {
     SetFanSpeed { ac: usize, rpm: i32 },      // Fan speed
     GetFanSpeed { ac: usize },                 // Get (Fan speed)
@@ -52,11 +56,12 @@ pub enum DaemonCommand {
     SetDgpuRuntimePM { enabled: bool },
     SetGpuMode { mode: String },
     ProbeBatteryHealthOptimizer,
+    GetFanSpeedAndLogo { ac: usize },          // Combined tray poll: one round-trip
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 /// Represents data sent back from Daemon after it receives
-/// a command.
+/// a command. New variants must be appended at the END (see DaemonCommand).
 pub enum DaemonResponse {
     SetFanSpeed { result: bool },                    // Response
     GetFanSpeed { rpm: i32 },                        // Get (Fan speed)
@@ -96,6 +101,7 @@ pub enum DaemonResponse {
         is_on: bool,
         threshold: u8,
     },
+    GetFanSpeedAndLogo { rpm: i32, logo_state: u8 },
 }
 
 #[allow(dead_code)]
@@ -201,5 +207,40 @@ pub fn read_from_socket_req(bytes: &[u8]) -> Option<DaemonCommand> {
             println!("REQ ERROR: {}", e);
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip_cmd(cmd: DaemonCommand) {
+        let bytes = bincode::serialize(&cmd).expect("serialize command");
+        assert_eq!(bincode::deserialize::<DaemonCommand>(&bytes).expect("deserialize command"), cmd);
+    }
+
+    fn roundtrip_resp(resp: DaemonResponse) {
+        let bytes = bincode::serialize(&resp).expect("serialize response");
+        assert_eq!(bincode::deserialize::<DaemonResponse>(&bytes).expect("deserialize response"), resp);
+    }
+
+    #[test]
+    fn fan_and_logo_status_roundtrips_through_bincode() {
+        roundtrip_cmd(DaemonCommand::GetFanSpeedAndLogo { ac: 1 });
+        roundtrip_resp(DaemonResponse::GetFanSpeedAndLogo { rpm: 4300, logo_state: 2 });
+    }
+
+    #[test]
+    fn existing_tray_protocol_roundtrips_through_bincode() {
+        roundtrip_cmd(DaemonCommand::GetFanSpeed { ac: 0 });
+        roundtrip_cmd(DaemonCommand::SetFanSpeed { ac: 1, rpm: 4300 });
+        roundtrip_cmd(DaemonCommand::GetLogoLedState { ac: 1 });
+        roundtrip_cmd(DaemonCommand::SetLogoLedState { ac: 0, logo_state: 2 });
+        roundtrip_cmd(DaemonCommand::GetDeviceName);
+        roundtrip_resp(DaemonResponse::GetFanSpeed { rpm: 0 });
+        roundtrip_resp(DaemonResponse::SetFanSpeed { result: true });
+        roundtrip_resp(DaemonResponse::GetLogoLedState { logo_state: 1 });
+        roundtrip_resp(DaemonResponse::SetLogoLedState { result: false });
+        roundtrip_resp(DaemonResponse::GetDeviceName { name: "Blade 15".into() });
     }
 }
