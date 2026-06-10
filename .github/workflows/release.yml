@@ -13,7 +13,34 @@ env:
   APP_VERSION: "0.3.0-rc6"
 
 jobs:
+  # Fail the whole release if the version drifted between its three sources.
+  # Bump with scripts/bump-version.sh, which updates all of them together.
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify version consistency
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version = ' razer_control_gui/Cargo.toml | cut -d'"' -f2)
+          SPEC_VERSION=$(grep -m1 '^Version:' packaging/fedora/razercontrol.spec | awk '{print $2}')
+          echo "workflow APP_VERSION=$APP_VERSION  Cargo.toml=$CARGO_VERSION  spec=$SPEC_VERSION  ref=$GITHUB_REF_NAME"
+          FAIL=0
+          if [ "$CARGO_VERSION" != "$APP_VERSION" ]; then
+            echo "::error file=razer_control_gui/Cargo.toml::Cargo.toml version ($CARGO_VERSION) != workflow APP_VERSION ($APP_VERSION)"
+            FAIL=1
+          fi
+          if [ "$SPEC_VERSION" != "${APP_VERSION/-rc/~rc}" ]; then
+            echo "::error file=packaging/fedora/razercontrol.spec::spec Version ($SPEC_VERSION) != expected (${APP_VERSION/-rc/~rc})"
+            FAIL=1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$APP_VERSION" ]; then
+            echo "::error::pushed tag ($GITHUB_REF_NAME) != v$APP_VERSION — tag the commit that bumps the version"
+            FAIL=1
+          fi
+          exit $FAIL
+
   build-rpm:
+    needs: check-version
     runs-on: ubuntu-latest
     container: fedora:41
     steps:
@@ -62,6 +89,7 @@ jobs:
           path: rpm-output/*.rpm
 
   build-deb:
+    needs: check-version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -162,6 +190,7 @@ jobs:
           path: razercontrol-revived_*.deb
 
   check-nix:
+    needs: check-version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -178,6 +207,7 @@ jobs:
         run: nix build --print-build-logs
 
   build-tarball:
+    needs: check-version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -234,6 +264,7 @@ jobs:
           path: razer-control-*.tar.gz
 
   build-arch:
+    needs: check-version
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
