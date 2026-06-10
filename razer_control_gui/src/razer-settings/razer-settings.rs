@@ -608,7 +608,7 @@ fn get_cpu_utilization() -> Option<u32> {
 }
 
 /// Create system monitor panel at the bottom (widget-style layout)
-fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
+fn create_system_monitor(sensor_rx: Option<std::sync::mpsc::Receiver<tray::SensorState>>) -> gtk::Box {
     let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     main_box.set_margin_start(16);
     main_box.set_margin_end(16);
@@ -721,22 +721,20 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
     main_box.append(&dgpu_row);
     main_box.append(&bottom_row);
 
-    glib::timeout_add_local(Duration::from_secs(2), move || {
-        let cpu_temp = get_cpu_temperature();
-        let igpu_temp = get_igpu_temperature();
-        let dgpu_temp = get_gpu_temperature();
-        let on_ac = check_if_running_on_ac_power();
-        let ac = on_ac.unwrap_or(true);
-        let fan = get_fan_speed(ac);
-        let battery_pct = get_battery_percentage();
-        let battery_status = get_battery_status();
-        let battery_power = get_battery_power();
-        let sys_power = get_system_power();
-        let cpu_util = get_cpu_utilization();
-        let igpu_pwr = get_igpu_power();
-        let igpu_util = get_igpu_utilization();
-        let dgpu_pwr = get_dgpu_power();
-        let dgpu_util = get_dgpu_utilization();
+    let update_fn = move |s: tray::SensorState| {
+        let cpu_temp     = s.cpu_temp;
+        let igpu_temp    = s.igpu_temp;
+        let dgpu_temp    = s.dgpu_temp;
+        let fan          = s.fan_speed;
+        let battery_pct  = s.battery_pct;
+        let battery_status = s.battery_status.clone();
+        let battery_power  = s.battery_power;
+        let sys_power    = s.system_power;
+        let cpu_util     = s.cpu_util;
+        let igpu_pwr     = s.igpu_power;
+        let igpu_util    = s.igpu_util;
+        let dgpu_pwr     = s.dgpu_power;
+        let dgpu_util    = s.dgpu_util;
 
         // CPU
         match cpu_temp {
@@ -822,27 +820,23 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
             Some(rpm) => { fan_l.set_text(&format!("Fan: {} RPM", rpm)); fan_l.set_visible(true); }
             None => fan_l.set_visible(false),
         }
+    };
 
-        // Write snapshot to shared state for tray tooltip
-        if let Ok(mut state) = shared_state.lock() {
-            state.cpu_temp = cpu_temp;
-            state.igpu_temp = igpu_temp;
-            state.dgpu_temp = dgpu_temp;
-            state.fan_speed = fan;
-            state.on_ac = on_ac;
-            state.battery_pct = battery_pct;
-            state.battery_status = battery_status.clone();
-            state.battery_power = battery_power;
-            state.system_power = sys_power;
-            state.cpu_util = cpu_util;
-            state.igpu_power = igpu_pwr;
-            state.igpu_util = igpu_util;
-            state.dgpu_power = dgpu_pwr;
-            state.dgpu_util = dgpu_util;
-        }
-
-        glib::ControlFlow::Continue
-    });
+    if let Some(rx) = sensor_rx {
+        glib::timeout_add_local(Duration::from_millis(200), move || {
+            let mut latest = None;
+            loop {
+                match rx.try_recv() {
+                    Ok(s) => latest = Some(s),
+                    Err(_) => break,
+                }
+            }
+            if let Some(state) = latest {
+                update_fn(state);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
     main_box
 }
@@ -877,8 +871,12 @@ fn main() {
     // Keep the app alive even when the window is hidden (close-to-tray)
     let _hold_guard = app.hold();
 
+    // Channel receiver shared between connect_startup (producer) and connect_activate (consumer)
+    let sensor_rx_slot: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<tray::SensorState>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+
     // Spawn tray only on primary instance (inside connect_startup)
     let tray_state = Arc::clone(&shared_state);
+    let sensor_rx_slot_startup = Arc::clone(&sensor_rx_slot);
     app.connect_startup(move |_| {
         adw::init().ok();
 
@@ -903,11 +901,15 @@ fn main() {
             }
         }
 
-        // Background sensor polling — keeps tray tooltip data fresh even if window never opened
-        tray::start_background_polling(Arc::clone(&tray_state));
+        // Background sensor polling — push updates via channel to monitor bar
+        let sensor_rx = tray::start_background_polling(Arc::clone(&tray_state));
+        if let Ok(mut slot) = sensor_rx_slot_startup.lock() {
+            *slot = Some(sensor_rx);
+        }
     });
 
     let shared_state_for_activate = Arc::clone(&shared_state);
+    let sensor_rx_slot_activate = Arc::clone(&sensor_rx_slot);
     app.connect_activate(move |app| {
         // If a window already exists (even if hidden), show it
         let windows = app.windows();
@@ -1020,7 +1022,8 @@ fn main() {
 
         let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
         content_box.append(&separator);
-        let monitor = create_system_monitor(Arc::clone(&shared_state_for_activate));
+        let sensor_rx = sensor_rx_slot_activate.lock().ok().and_then(|mut s| s.take());
+        let monitor = create_system_monitor(sensor_rx);
         content_box.append(&monitor);
 
         let toast_overlay = adw::ToastOverlay::new();

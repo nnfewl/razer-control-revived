@@ -71,6 +71,8 @@ chmod +x RazerControl-0.2.3-x86_64.AppImage
 - ⌨️ **CLI** - Full command-line control for scripting
 - 🔄 **Daemon** - Auto-loads your settings on startup
 
+> **Note:** Battery Health Optimizer support is model-specific. For example, Blade 15 Advanced 2020 (`1532:0253`) is supported for fan, power, and lighting controls, but does not advertise BHO charge limiting.
+
 ## 📋 Supported Devices
 
 | Model | Year | USB PID | Status |
@@ -220,6 +222,8 @@ razer-cli write logo ac 1
 razer-cli write bho on 80       # Limit to 80%
 razer-cli write bho off         # Disable limit
 ```
+
+If your device does not advertise BHO support, these commands report that Battery Health Optimizer is not supported on that model.
 
 ### RGB Effects
 

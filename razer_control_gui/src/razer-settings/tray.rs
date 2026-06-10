@@ -191,9 +191,17 @@ fn get_fan_range_from_daemon() -> (i32, i32) {
     (3500, 5000)
 }
 
-pub fn start_background_polling(state: SharedSensorState) {
+pub fn start_background_polling(state: SharedSensorState) -> std::sync::mpsc::Receiver<SensorState> {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let (fan_min, fan_max) = get_fan_range_from_daemon();
+        // Retry until daemon is ready (it may not be up at app launch)
+        let (fan_min, fan_max) = loop {
+            let result = get_fan_range_from_daemon();
+            if result != (3500, 5000) {
+                break result;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        };
         if let Ok(mut s) = state.lock() {
             s.fan_min = fan_min;
             s.fan_max = fan_max;
@@ -216,11 +224,13 @@ pub fn start_background_polling(state: SharedSensorState) {
             if let Ok(mut s) = state.lock() {
                 let (fan_min, fan_max) = (s.fan_min, s.fan_max);
                 *s = SensorState { fan_speed, fan_min, fan_max, ..fresh };
+                let _ = sender.send(s.clone()); // non-blocking, ok to drop if receiver gone
             }
 
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
+    receiver
 }
 
 pub struct RazerTray {
@@ -297,11 +307,17 @@ impl ksni::Tray for RazerTray {
         let fan_submenu_label = format!("Fan Speed  ·  {}", current_preset);
 
         // Status lines
-        let cpu_line = match (state.cpu_temp, state.cpu_util) {
-            (Some(t), Some(u)) => Some(format!("CPU  {:.0}°C · {}%", t, u)),
-            (Some(t), None)    => Some(format!("CPU  {:.0}°C", t)),
-            _ => None,
-        };
+        fn stat_line(name: &str, temp: Option<f64>, util: Option<u32>) -> Option<String> {
+            let right = match (temp, util) {
+                (Some(t), Some(u)) => format!("{:.0}°C · {}%", t, u),
+                (Some(t), None)    => format!("{:.0}°C", t),
+                _ => return None,
+            };
+            Some(format!("{}\t{}", name, right))
+        }
+        let cpu_line  = stat_line("CPU",  state.cpu_temp,  state.cpu_util);
+        let igpu_line = stat_line("iGPU", state.igpu_temp, state.igpu_util);
+        let dgpu_line = stat_line("dGPU", state.dgpu_temp, state.dgpu_util);
         let bat_line = match (state.battery_pct, state.on_ac, state.battery_status.as_deref(), state.battery_power) {
             (Some(pct), Some(true), Some("Charging"), Some(w)) =>
                 Some(format!("Battery  {}%  ·  AC +{:.0}W", pct, w)),
@@ -359,12 +375,7 @@ impl ksni::Tray for RazerTray {
         ];
 
         // Status section
-        if let Some(line) = cpu_line {
-            items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label: line, enabled: false, ..Default::default()
-            }));
-        }
-        if let Some(line) = bat_line {
+        for line in [cpu_line, igpu_line, dgpu_line, bat_line].into_iter().flatten() {
             items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: line, enabled: false, ..Default::default()
             }));
