@@ -893,16 +893,23 @@ fn main() {
 
         // Spawn KDE system tray icon (only on primary instance)
         let tray = tray::RazerTray::new(Arc::clone(&tray_state));
-        {
+        let on_update: Box<dyn Fn() + Send + 'static> = {
             use ksni::blocking::TrayMethods;
             match tray.spawn() {
-                Ok(_handle) => {} // tray runs in background thread
-                Err(e) => eprintln!("Tray error (non-fatal): {}", e),
+                Ok(handle) => {
+                    // Clone handle into closure so it stays alive in the background thread
+                    Box::new(move || { handle.update(|_| {}); })
+                }
+                Err(e) => {
+                    eprintln!("Tray error (non-fatal): {}", e);
+                    Box::new(|| {})
+                }
             }
-        }
+        };
 
-        // Background sensor polling — push updates via channel to monitor bar
-        let sensor_rx = tray::start_background_polling(Arc::clone(&tray_state));
+        // Background sensor polling — push updates via channel to monitor bar,
+        // and call on_update() after each poll so the tray host re-fetches the menu
+        let sensor_rx = tray::start_background_polling(Arc::clone(&tray_state), on_update);
         if let Ok(mut slot) = sensor_rx_slot_startup.lock() {
             *slot = Some(sensor_rx);
         }

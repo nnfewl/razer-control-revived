@@ -152,55 +152,19 @@ pub fn new_shared_state() -> SharedSensorState {
     Arc::new(Mutex::new(SensorState::default()))
 }
 
-fn get_fan_range_from_daemon() -> (i32, i32) {
-    let name = crate::comms::try_bind()
-        .ok()
-        .and_then(|socket| crate::comms::send_to_daemon(
-            crate::comms::DaemonCommand::GetDeviceName, socket,
-        ))
-        .and_then(|resp| match resp {
-            crate::comms::DaemonResponse::GetDeviceName { name } => Some(name),
-            _ => None,
-        });
 
-    let name = match name {
-        Some(n) => n,
-        None => return (3500, 5000),
-    };
-
-    let path = std::env::var("RAZER_DEVICE_FILE")
-        .unwrap_or_else(|_| "/usr/share/razercontrol/laptops.json".into());
-    let json = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return (3500, 5000),
-    };
-    let devices: Vec<serde_json::Value> = match serde_json::from_str(&json) {
-        Ok(v) => v,
-        Err(_) => return (3500, 5000),
-    };
-
-    for device in devices {
-        if device["name"].as_str() == Some(&name) {
-            if let Some(fan) = device["fan"].as_array() {
-                let min = fan.first().and_then(|v| v.as_i64()).unwrap_or(3500) as i32;
-                let max = fan.get(1).and_then(|v| v.as_i64()).unwrap_or(5000) as i32;
-                return (min, max);
-            }
-        }
-    }
-    (3500, 5000)
-}
-
-pub fn start_background_polling(state: SharedSensorState) -> std::sync::mpsc::Receiver<SensorState> {
+pub fn start_background_polling(
+    state: SharedSensorState,
+    on_update: impl Fn() + Send + 'static,
+) -> std::sync::mpsc::Receiver<SensorState> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        // Retry until daemon is ready (it may not be up at app launch)
+        // Retry until daemon responds (connection may not be ready at app launch)
         let (fan_min, fan_max) = loop {
-            let result = get_fan_range_from_daemon();
-            if result != (3500, 5000) {
-                break result;
+            match try_get_fan_range_from_daemon() {
+                Some(range) => break range,
+                None => std::thread::sleep(std::time::Duration::from_secs(2)),
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
         };
         if let Ok(mut s) = state.lock() {
             s.fan_min = fan_min;
@@ -224,13 +188,44 @@ pub fn start_background_polling(state: SharedSensorState) -> std::sync::mpsc::Re
             if let Ok(mut s) = state.lock() {
                 let (fan_min, fan_max) = (s.fan_min, s.fan_max);
                 *s = SensorState { fan_speed, fan_min, fan_max, ..fresh };
-                let _ = sender.send(s.clone()); // non-blocking, ok to drop if receiver gone
+                let _ = sender.send(s.clone());
             }
+
+            on_update(); // signal tray host to re-fetch menu with fresh state
 
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
     receiver
+}
+
+/// Returns `None` if the daemon is not reachable, `Some((min,max))` on success.
+fn try_get_fan_range_from_daemon() -> Option<(i32, i32)> {
+    let name = crate::comms::try_bind()
+        .ok()
+        .and_then(|socket| crate::comms::send_to_daemon(
+            crate::comms::DaemonCommand::GetDeviceName, socket,
+        ))
+        .and_then(|resp| match resp {
+            crate::comms::DaemonResponse::GetDeviceName { name } => Some(name),
+            _ => None,
+        })?;
+
+    let path = std::env::var("RAZER_DEVICE_FILE")
+        .unwrap_or_else(|_| "/usr/share/razercontrol/laptops.json".into());
+    let json = fs::read_to_string(&path).ok()?;
+    let devices: Vec<serde_json::Value> = serde_json::from_str(&json).ok()?;
+
+    for device in devices {
+        if device["name"].as_str() == Some(&name) {
+            if let Some(fan) = device["fan"].as_array() {
+                let min = fan.first().and_then(|v| v.as_i64()).unwrap_or(3500) as i32;
+                let max = fan.get(1).and_then(|v| v.as_i64()).unwrap_or(5000) as i32;
+                return Some((min, max));
+            }
+        }
+    }
+    Some((3500, 5000)) // device found but no fan range — use defaults
 }
 
 pub struct RazerTray {
