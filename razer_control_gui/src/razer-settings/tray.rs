@@ -288,39 +288,43 @@ fn fan_presets(fan_min: i32, fan_max: i32) -> [(i32, &'static str); 5] {
     ]
 }
 
-/// Exact match only — no fuzzy nearest-preset selection
-fn selected_preset_index(presets: &[(i32, &'static str)], current_rpm: i32) -> Option<usize> {
+/// Exact match only — no fuzzy nearest-preset selection. `None` fan speed
+/// (daemon unreachable) selects nothing rather than looking like Auto.
+fn selected_preset_index(presets: &[(i32, &'static str)], fan_speed: Option<i32>) -> Option<usize> {
+    let current_rpm = fan_speed?;
     presets.iter().position(|(rpm, _)| *rpm == current_rpm)
 }
 
 /// Preset label on exact match, otherwise the fan position as a percentage
-/// of the device range ("Auto" for non-positive RPM).
+/// of the device range ("Auto" for non-positive RPM, "…" when the fan speed
+/// is unknown because the daemon is unreachable).
 fn fan_current_label(
     presets: &[(i32, &'static str)],
     selected: Option<usize>,
-    current_rpm: i32,
+    fan_speed: Option<i32>,
     fan_min: i32,
     fan_max: i32,
 ) -> String {
-    match selected {
-        Some(i) => presets[i].1.to_string(),
-        None if current_rpm <= 0 => "Auto".to_string(),
-        None => {
+    match (selected, fan_speed) {
+        (Some(i), _) => presets[i].1.to_string(),
+        (None, None) => "…".to_string(),
+        (None, Some(rpm)) if rpm <= 0 => "Auto".to_string(),
+        (None, Some(rpm)) => {
             let range = fan_max - fan_min;
             let pct = if range > 0 {
-                ((current_rpm - fan_min) as f64 / range as f64 * 100.0).round() as i32
+                ((rpm - fan_min) as f64 / range as f64 * 100.0).round() as i32
             } else { 0 };
             format!("{}%", pct.clamp(0, 100))
         }
     }
 }
 
-/// Label for the current logo state; unknown or out-of-range states fall
-/// back to "On" (see REVIEW_FINDINGS.md #3).
+/// Label for the current logo state; "…" when the state is unknown
+/// (daemon not yet polled) or out of range.
 fn logo_label(logo_state: Option<u8>) -> &'static str {
     logo_state
         .and_then(|s| LOGO_LABELS.get(s as usize).copied())
-        .unwrap_or("On")
+        .unwrap_or("…")
 }
 
 pub struct RazerTray {
@@ -369,13 +373,12 @@ impl ksni::Tray for RazerTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let state = self.state.lock().ok().map(|s| s.clone()).unwrap_or_default();
-        let current_rpm = state.fan_speed.unwrap_or(0);
         let fan_min = state.fan_min;
         let fan_max = state.fan_max;
 
         let presets = fan_presets(fan_min, fan_max);
-        let selected = selected_preset_index(&presets, current_rpm);
-        let current_label = fan_current_label(&presets, selected, current_rpm, fan_min, fan_max);
+        let selected = selected_preset_index(&presets, state.fan_speed);
+        let current_label = fan_current_label(&presets, selected, state.fan_speed, fan_min, fan_max);
         let fan_submenu_label = format!("Fan Speed  ·  {}", current_label);
 
         // Status lines
@@ -777,37 +780,50 @@ mod tests {
     #[test]
     fn preset_selection_is_exact_match_only() {
         let p = fan_presets(3500, 5000);
-        assert_eq!(selected_preset_index(&p, 4300), Some(2));
-        assert_eq!(selected_preset_index(&p, 0), Some(0)); // Auto
-        assert_eq!(selected_preset_index(&p, 4000), None); // no fuzzy matching
+        assert_eq!(selected_preset_index(&p, Some(4300)), Some(2));
+        assert_eq!(selected_preset_index(&p, Some(0)), Some(0)); // Auto
+        assert_eq!(selected_preset_index(&p, Some(4000)), None); // no fuzzy matching
+    }
+
+    #[test]
+    fn no_preset_checked_when_fan_speed_unknown() {
+        // Daemon unreachable must not look like Auto mode (REVIEW_FINDINGS #2)
+        let p = fan_presets(3500, 5000);
+        assert_eq!(selected_preset_index(&p, None), None);
+    }
+
+    #[test]
+    fn fan_label_shows_unknown_when_fan_speed_unknown() {
+        let p = fan_presets(3500, 5000);
+        assert_eq!(fan_current_label(&p, None, None, 3500, 5000), "…");
     }
 
     #[test]
     fn fan_label_uses_preset_name_on_exact_match() {
         let p = fan_presets(3500, 5000);
-        assert_eq!(fan_current_label(&p, Some(3), 4600, 3500, 5000), "High");
+        assert_eq!(fan_current_label(&p, Some(3), Some(4600), 3500, 5000), "High");
     }
 
     #[test]
     fn fan_label_shows_percent_for_non_preset_rpm() {
         let p = fan_presets(3500, 5000);
         // (4000 - 3500) / 1500 = 33.3%
-        assert_eq!(fan_current_label(&p, None, 4000, 3500, 5000), "33%");
+        assert_eq!(fan_current_label(&p, None, Some(4000), 3500, 5000), "33%");
     }
 
     #[test]
     fn fan_label_percent_is_clamped_and_division_safe() {
         let p = fan_presets(3500, 5000);
-        assert_eq!(fan_current_label(&p, None, 5400, 3500, 5000), "100%");
-        assert_eq!(fan_current_label(&p, None, 3400, 3500, 5000), "0%");
+        assert_eq!(fan_current_label(&p, None, Some(5400), 3500, 5000), "100%");
+        assert_eq!(fan_current_label(&p, None, Some(3400), 3500, 5000), "0%");
         // degenerate range (min == max) must not divide by zero
-        assert_eq!(fan_current_label(&[], None, 4000, 4000, 4000), "0%");
+        assert_eq!(fan_current_label(&[], None, Some(4000), 4000, 4000), "0%");
     }
 
     #[test]
     fn fan_label_negative_rpm_reads_auto() {
         let p = fan_presets(3500, 5000);
-        assert_eq!(fan_current_label(&p, None, -1, 3500, 5000), "Auto");
+        assert_eq!(fan_current_label(&p, None, Some(-1), 3500, 5000), "Auto");
     }
 
     #[test]
@@ -818,10 +834,10 @@ mod tests {
     }
 
     #[test]
-    fn logo_label_falls_back_to_on_for_unknown_state() {
-        // Characterizes current behavior; REVIEW_FINDINGS.md #3 proposes an
-        // explicit unknown marker here instead.
-        assert_eq!(logo_label(None), "On");
-        assert_eq!(logo_label(Some(7)), "On");
+    fn logo_label_shows_unknown_marker_for_unknown_state() {
+        // Unknown state must not assert "On" — the daemon may not have
+        // responded yet, or the state may be out of range (REVIEW_FINDINGS #3)
+        assert_eq!(logo_label(None), "…");
+        assert_eq!(logo_label(Some(7)), "…");
     }
 }
