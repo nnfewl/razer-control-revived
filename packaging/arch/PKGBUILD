@@ -1,6 +1,6 @@
 # Maintainer: nnfewl <nnfewl@users.noreply.github.com>
 pkgname=razer-control-bin
-pkgver=0.3.0rc5
+pkgver=0.3.0rc6
 pkgrel=1
 pkgdesc="Razer laptop control for Linux — fan, power, RGB, battery health. No kernel modules required."
 arch=('x86_64')
