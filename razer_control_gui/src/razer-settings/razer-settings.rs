@@ -1123,12 +1123,10 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     let fan_stage_step = (max_fan_speed - min_fan_speed) / fan_stages as f64;
     for i in 0..=fan_stages {
         let rpm = ((min_fan_speed + fan_stage_step * i as f64) / 100.0).round() * 100.0;
-        let label = if i == 0 {
-            "Min".to_string()
-        } else if i == fan_stages {
-            "Max".to_string()
-        } else {
-            format!("{}%", i * 100 / fan_stages)
+        let label = match i {
+            0 => "Min".to_string(),
+            _ if i == fan_stages => "Max".to_string(),
+            _ => format!("{}%", i * 100 / fan_stages),
         };
         fan_slider.add_mark(rpm, Some(&label));
     }
@@ -1141,7 +1139,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     fan_spin.set_valign(gtk::Align::Center);
     let fan_spin_row = adw::ActionRow::new();
     fan_spin_row.set_title("Exact RPM");
-    fan_spin_row.set_subtitle("Type or scroll to fine-tune");
+    fan_spin_row.set_subtitle("Hardware granularity: 100 RPM steps");
     fan_spin_row.add_suffix(&fan_spin);
     fan_section.add_row(&fan_spin_row);
 

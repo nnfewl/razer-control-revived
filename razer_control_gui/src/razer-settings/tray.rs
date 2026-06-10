@@ -171,6 +171,7 @@ pub fn start_background_polling(
             s.fan_max = fan_max;
         }
 
+        let mut prev_fan_speed: Option<i32> = None;
         loop {
             let fresh = SensorState::read_fresh();
             let ac = fresh.on_ac.unwrap_or(true);
@@ -191,7 +192,13 @@ pub fn start_background_polling(
                 let _ = sender.send(s.clone());
             }
 
-            on_update(); // signal tray host to re-fetch menu with fresh state
+            // Only poke the tray host when fan speed changes — sending an update
+            // every poll cycle causes KDE to close/reset the submenu while the user
+            // is trying to interact with it.
+            if fan_speed != prev_fan_speed {
+                prev_fan_speed = fan_speed;
+                on_update();
+            }
 
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
@@ -280,30 +287,35 @@ impl ksni::Tray for RazerTray {
         let fan_max = state.fan_max;
         let range = fan_max - fan_min;
 
-        // Round to nearest 100 to match slider marks in the app
+        // Round to nearest 100 to match hardware granularity (clamp_fan divides by 100)
         let pct_rpm = |p: f64| -> i32 {
             ((fan_min as f64 + range as f64 * p) / 100.0).round() as i32 * 100
         };
-        let presets: [(i32, &str); 6] = [
+        let presets: [(i32, &str); 5] = [
             (0,               "Auto"),
-            (fan_min,         "Min"),
-            (pct_rpm(0.25),   "25%"),
-            (pct_rpm(0.50),   "50%"),
-            (pct_rpm(0.75),   "75%"),
+            (pct_rpm(0.25),   "Low"),
+            (pct_rpm(0.50),   "Medium"),
+            (pct_rpm(0.75),   "High"),
             (fan_max,         "Max"),
         ];
 
-        let selected = presets.iter().enumerate()
-            .min_by_key(|(_, (rpm, _))| {
-                if *rpm == 0 && current_rpm == 0 { 0 }
-                else if *rpm == 0 { i32::MAX }
-                else { (current_rpm - rpm).abs() }
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        // Exact match only — no fuzzy nearest-preset selection
+        let selected: Option<usize> = presets.iter().enumerate()
+            .find(|(_, (rpm, _))| *rpm == current_rpm)
+            .map(|(i, _)| i);
 
-        let current_preset = presets.get(selected).map(|(_, l)| *l).unwrap_or("Auto");
-        let fan_submenu_label = format!("Fan Speed  ·  {}", current_preset);
+        // Header shows preset label if exact match, otherwise the actual calculated %
+        let current_label = match selected {
+            Some(i) => presets[i].1.to_string(),
+            None if current_rpm <= 0 => "Auto".to_string(),
+            None => {
+                let pct = if range > 0 {
+                    ((current_rpm - fan_min) as f64 / range as f64 * 100.0).round() as i32
+                } else { 0 };
+                format!("{}%", pct.clamp(0, 100))
+            }
+        };
+        let fan_submenu_label = format!("Fan Speed  ·  {}", current_label);
 
         // Status lines
         fn stat_line(name: &str, temp: Option<f64>, util: Option<u32>) -> Option<String> {
@@ -312,7 +324,7 @@ impl ksni::Tray for RazerTray {
                 (Some(t), None)    => format!("{:.0}°C", t),
                 _ => return None,
             };
-            Some(format!("{}\t{}", name, right))
+            Some(format!("{}  {}", name, right))
         }
         let cpu_line  = stat_line("CPU",  state.cpu_temp,  state.cpu_util);
         let igpu_line = stat_line("iGPU", state.igpu_temp, state.igpu_util);
@@ -349,10 +361,10 @@ impl ksni::Tray for RazerTray {
                 label: fan_submenu_label,
                 submenu: presets.iter().enumerate().map(|(i, (rpm, label))| {
                     let rpm = *rpm;
-                    let display = if rpm == 0 { label.to_string() } else { format!("{} ({} RPM)", label, rpm) };
+                    let display = label.to_string();
                     ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
                         label: display,
-                        checked: i == selected,
+                        checked: selected == Some(i),
                         activate: Box::new(move |tray: &mut RazerTray| {
                             let ac = if on_ac { 1 } else { 0 };
                             let _ = crate::comms::try_bind()
