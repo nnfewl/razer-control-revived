@@ -683,7 +683,47 @@ fn read_battery_pct() -> Option<u8> {
     None
 }
 
+/// Compute watts from a RAPL energy counter reading.
+///
+/// Uses a monotonic clock (immune to NTP steps) and handles counter wraparound
+/// via `max_range_uj` (from the sibling `max_energy_range_uj` sysfs file;
+/// pass 0 to skip wraparound recovery). Returns `None` on the first call
+/// (no baseline) or when the counter cannot be interpreted. µJ / µs = W.
+pub(super) fn rapl_watts(
+    energy_uj: u64,
+    max_range_uj: u64,
+    last_e: &std::sync::atomic::AtomicU64,
+    last_t: &std::sync::atomic::AtomicU64,
+) -> Option<f64> {
+    use std::sync::atomic::Ordering;
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = BASE.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
+    let pe = last_e.swap(energy_uj, Ordering::Relaxed);
+    let pt = last_t.swap(now, Ordering::Relaxed);
+    if pe == 0 || pt == 0 || now <= pt { return None; }
+    let delta_e = if energy_uj >= pe {
+        energy_uj - pe
+    } else if max_range_uj > 0 {
+        (max_range_uj - pe) + energy_uj  // counter wrapped
+    } else {
+        return None;
+    };
+    let dt = now - pt;
+    if dt == 0 { return None; }
+    Some(delta_e as f64 / dt as f64)
+}
+
+fn rapl_read(path: &str, last_e: &std::sync::atomic::AtomicU64, last_t: &std::sync::atomic::AtomicU64) -> Option<f64> {
+    let energy: u64 = fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    let max_range: u64 = fs::read_to_string(&path.replace("energy_uj", "max_energy_range_uj"))
+        .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    rapl_watts(energy, max_range, last_e, last_t)
+}
+
 fn read_system_power() -> Option<f64> {
+    use std::sync::atomic::AtomicU64;
+    static LAST_E: AtomicU64 = AtomicU64::new(0);
+    static LAST_T: AtomicU64 = AtomicU64::new(0);
     let paths = [
         "/sys/class/powercap/amd-rapl:0/energy_uj",
         "/sys/class/powercap/amd_rapl/amd-rapl:0/energy_uj",
@@ -691,31 +731,15 @@ fn read_system_power() -> Option<f64> {
         "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
     ];
     for path in &paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(energy) = content.trim().parse::<u64>() {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static LAST_E: AtomicU64 = AtomicU64::new(0);
-                static LAST_T: AtomicU64 = AtomicU64::new(0);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
-                let pe = LAST_E.swap(energy, Ordering::Relaxed);
-                let pt = LAST_T.swap(now, Ordering::Relaxed);
-                if pe > 0 && pt > 0 && energy > pe {
-                    let dt = now - pt;
-                    if dt > 0 {
-                        return Some((energy - pe) as f64 / dt as f64);
-                    }
-                }
-                return None;
-            }
+        if fs::metadata(path).is_ok() {
+            return rapl_read(path, &LAST_E, &LAST_T);
         }
     }
     None
 }
 
 fn read_igpu_power() -> Option<f64> {
+    use std::sync::atomic::AtomicU64;
     // AMD: hwmon "amdgpu" exposes instantaneous power directly
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
@@ -733,6 +757,8 @@ fn read_igpu_power() -> Option<f64> {
         }
     }
     // Intel: RAPL "uncore" domain = iGPU + LLC; closest available iGPU power source
+    static LAST_E: AtomicU64 = AtomicU64::new(0);
+    static LAST_T: AtomicU64 = AtomicU64::new(0);
     let rapl_candidates = [
         "/sys/class/powercap/intel-rapl:0:1/energy_uj",
         "/sys/class/powercap/intel-rapl-mmio:0:0/energy_uj",
@@ -745,25 +771,8 @@ fn read_igpu_power() -> Option<f64> {
         };
         let Ok(name_content) = fs::read_to_string(&name_path) else { continue };
         if name_content.trim() != "uncore" { continue; }
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(energy) = content.trim().parse::<u64>() {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static LAST_E: AtomicU64 = AtomicU64::new(0);
-                static LAST_T: AtomicU64 = AtomicU64::new(0);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
-                let pe = LAST_E.swap(energy, Ordering::Relaxed);
-                let pt = LAST_T.swap(now, Ordering::Relaxed);
-                if pe > 0 && pt > 0 && energy > pe {
-                    let dt = now - pt;
-                    if dt > 0 {
-                        return Some((energy - pe) as f64 / dt as f64);
-                    }
-                }
-                return None;
-            }
+        if fs::metadata(path).is_ok() {
+            return rapl_read(path, &LAST_E, &LAST_T);
         }
     }
     None

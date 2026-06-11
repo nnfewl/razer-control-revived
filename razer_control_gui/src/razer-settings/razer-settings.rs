@@ -344,37 +344,22 @@ fn get_gpu_temperature() -> Option<f64> {
 
 /// Read system/CPU power consumption from RAPL (supports AMD and Intel)
 fn get_system_power() -> Option<f64> {
+    use std::sync::atomic::AtomicU64;
+    static LAST_E: AtomicU64 = AtomicU64::new(0);
+    static LAST_T: AtomicU64 = AtomicU64::new(0);
     let energy_paths = [
         "/sys/class/powercap/amd-rapl:0/energy_uj",
         "/sys/class/powercap/amd_rapl/amd-rapl:0/energy_uj",
         "/sys/class/powercap/intel-rapl:0/energy_uj",
         "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
     ];
-
     for path in &energy_paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(energy) = content.trim().parse::<u64>() {
-                static LAST_ENERGY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                static LAST_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
-
-                let prev_energy = LAST_ENERGY.swap(energy, std::sync::atomic::Ordering::Relaxed);
-                let prev_time = LAST_TIME.swap(now, std::sync::atomic::Ordering::Relaxed);
-
-                if prev_energy > 0 && prev_time > 0 && energy > prev_energy {
-                    let delta_energy = energy - prev_energy;
-                    let delta_time = now - prev_time;
-                    if delta_time > 0 {
-                        let power = delta_energy as f64 / delta_time as f64;
-                        return Some(power);
-                    }
-                }
-                return None; // Found path but need second reading
-            }
+        if fs::metadata(path).is_ok() {
+            let Ok(content) = fs::read_to_string(path) else { return None };
+            let Ok(energy) = content.trim().parse::<u64>() else { return None };
+            let max_range: u64 = fs::read_to_string(&path.replace("energy_uj", "max_energy_range_uj"))
+                .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            return tray::rapl_watts(energy, max_range, &LAST_E, &LAST_T);
         }
     }
     None
@@ -414,8 +399,9 @@ fn get_dgpu_utilization() -> Option<u32> {
     None
 }
 
-/// Read iGPU power from hwmon (AMD amdgpu) or Intel RAPL GT fallback
+/// Read iGPU power from hwmon (AMD amdgpu) or Intel RAPL uncore fallback
 fn get_igpu_power() -> Option<f64> {
+    use std::sync::atomic::AtomicU64;
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
@@ -431,35 +417,26 @@ fn get_igpu_power() -> Option<f64> {
             }
         }
     }
-
-    // Fallback: Intel RAPL GT domain
+    // Intel: RAPL "uncore" domain = iGPU + LLC; verify name to avoid CPU core power
+    static LAST_E: AtomicU64 = AtomicU64::new(0);
+    static LAST_T: AtomicU64 = AtomicU64::new(0);
     let paths = [
         "/sys/class/powercap/intel-rapl:0:1/energy_uj",
         "/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj",
     ];
-
     for path in &paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(energy) = content.trim().parse::<u64>() {
-                static LAST_IGPU_ENERGY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                static LAST_IGPU_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
-
-                let prev_energy = LAST_IGPU_ENERGY.swap(energy, std::sync::atomic::Ordering::Relaxed);
-                let prev_time = LAST_IGPU_TIME.swap(now, std::sync::atomic::Ordering::Relaxed);
-
-                if prev_energy > 0 && prev_time > 0 && energy > prev_energy {
-                    let delta_energy = energy - prev_energy;
-                    let delta_time = now - prev_time;
-                    if delta_time > 0 {
-                        return Some(delta_energy as f64 / delta_time as f64);
-                    }
-                }
-            }
+        let name_path = match std::path::Path::new(path).parent() {
+            Some(p) => p.join("name"),
+            None => continue,
+        };
+        let Ok(name_content) = fs::read_to_string(&name_path) else { continue };
+        if name_content.trim() != "uncore" { continue; }
+        if fs::metadata(path).is_ok() {
+            let Ok(content) = fs::read_to_string(path) else { return None };
+            let Ok(energy) = content.trim().parse::<u64>() else { return None };
+            let max_range: u64 = fs::read_to_string(&path.replace("energy_uj", "max_energy_range_uj"))
+                .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            return tray::rapl_watts(energy, max_range, &LAST_E, &LAST_T);
         }
     }
     None
@@ -751,7 +728,7 @@ fn create_system_monitor(sensor_state: tray::SharedSensorState) -> gtk::Box {
         }
 
         // iGPU
-        let igpu_has = igpu_temp.is_some() || igpu_pwr.is_some();
+        let igpu_has = igpu_temp.is_some() || igpu_pwr.is_some() || igpu_util.is_some();
         igpu_row.set_visible(igpu_has);
         if igpu_has {
             match igpu_temp {
