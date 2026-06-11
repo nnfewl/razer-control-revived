@@ -389,6 +389,15 @@ fn logo_label(logo_state: Option<u8>) -> &'static str {
         .unwrap_or("…")
 }
 
+/// One menu status row: "iGPU  54°C · 12%". Returns None when both fields are absent.
+fn stat_line(name: &str, temp: Option<f64>, util: Option<u32>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = temp { parts.push(format!("{:.0}°C", t)); }
+    if let Some(u) = util { parts.push(format!("{}%", u)); }
+    if parts.is_empty() { return None; }
+    Some(format!("{}  {}", name, parts.join(" · ")))
+}
+
 pub struct RazerTray {
     state: SharedSensorState,
 }
@@ -444,13 +453,6 @@ impl ksni::Tray for RazerTray {
         let fan_submenu_label = format!("Fan Speed  ·  {}", current_label);
 
         // Status lines
-        fn stat_line(name: &str, temp: Option<f64>, util: Option<u32>) -> Option<String> {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(t) = temp { parts.push(format!("{:.0}°C", t)); }
-            if let Some(u) = util { parts.push(format!("{}%", u)); }
-            if parts.is_empty() { return None; }
-            Some(format!("{}  {}", name, parts.join(" · ")))
-        }
         let cpu_line  = stat_line("CPU",  state.cpu_temp,  state.cpu_util);
         let igpu_line = stat_line("iGPU", state.igpu_temp, state.igpu_util);
         let dgpu_line = stat_line("dGPU", state.dgpu_temp, state.dgpu_util);
@@ -697,7 +699,9 @@ pub(super) fn rapl_watts(
 ) -> Option<f64> {
     use std::sync::atomic::Ordering;
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let now = BASE.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
+    // +1 ensures now >= 1 so last_t == 0 reliably means "no prior reading".
+    // The offset cancels in the delta (both readings carry it equally).
+    let now = BASE.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1;
     let pe = last_e.swap(energy_uj, Ordering::Relaxed);
     let pt = last_t.swap(now, Ordering::Relaxed);
     if pe == 0 || pt == 0 || now <= pt { return None; }
@@ -1030,5 +1034,78 @@ mod tests {
         // responded yet, or the state may be out of range (REVIEW_FINDINGS #3)
         assert_eq!(logo_label(None), "…");
         assert_eq!(logo_label(Some(7)), "…");
+    }
+
+    // --- stat_line ---
+
+    #[test]
+    fn stat_line_shows_temp_and_util() {
+        assert_eq!(stat_line("iGPU", Some(54.0), Some(12)), Some("iGPU  54°C · 12%".into()));
+    }
+
+    #[test]
+    fn stat_line_shows_temp_alone() {
+        assert_eq!(stat_line("CPU", Some(72.0), None), Some("CPU  72°C".into()));
+    }
+
+    #[test]
+    fn stat_line_shows_util_alone_no_temp() {
+        // Intel i915: util available via freq ratio but no hwmon temp entry
+        assert_eq!(stat_line("iGPU", None, Some(0)), Some("iGPU  0%".into()));
+        assert_eq!(stat_line("iGPU", None, Some(47)), Some("iGPU  47%".into()));
+    }
+
+    #[test]
+    fn stat_line_returns_none_when_both_absent() {
+        assert_eq!(stat_line("iGPU", None, None), None);
+    }
+
+    // --- rapl_watts ---
+
+    #[test]
+    fn rapl_watts_returns_none_on_first_call() {
+        use std::sync::atomic::AtomicU64;
+        // pe == 0 and pt == 0: no baseline established yet
+        let last_e = AtomicU64::new(0);
+        let last_t = AtomicU64::new(0);
+        assert_eq!(rapl_watts(1_000_000, 0, &last_e, &last_t), None);
+    }
+
+    #[test]
+    fn rapl_watts_computes_watts_on_second_call() {
+        use std::sync::atomic::AtomicU64;
+        let last_e = AtomicU64::new(0);
+        let last_t = AtomicU64::new(0);
+        rapl_watts(1_000_000, 0, &last_e, &last_t); // establish baseline
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // 100_000 µJ over ~10 ms ≈ 10 W
+        let w = rapl_watts(1_100_000, 0, &last_e, &last_t)
+            .expect("second call with time elapsed must return watts");
+        assert!(w > 0.0, "watts must be positive, got {w}");
+    }
+
+    #[test]
+    fn rapl_watts_returns_none_on_counter_decrease_without_range() {
+        use std::sync::atomic::AtomicU64;
+        let last_e = AtomicU64::new(0);
+        let last_t = AtomicU64::new(0);
+        rapl_watts(1_000_000, 0, &last_e, &last_t);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // energy decreased and no max_range provided → wraparound unrecoverable
+        assert_eq!(rapl_watts(500_000, 0, &last_e, &last_t), None);
+    }
+
+    #[test]
+    fn rapl_watts_recovers_counter_wraparound_with_max_range() {
+        use std::sync::atomic::AtomicU64;
+        let last_e = AtomicU64::new(0);
+        let last_t = AtomicU64::new(0);
+        let max: u64 = 262_144_000_000; // typical RAPL max_energy_range_uj
+        rapl_watts(max - 50_000, max, &last_e, &last_t); // baseline near top
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // counter wraps: new reading is 50_000, delta_e = 50_000 + 50_000 = 100_000 µJ
+        let w = rapl_watts(50_000, max, &last_e, &last_t)
+            .expect("wraparound with max_range must return watts");
+        assert!(w > 0.0, "wrapped watts must be positive, got {w}");
     }
 }
