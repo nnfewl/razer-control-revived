@@ -40,6 +40,7 @@ pub struct SensorState {
     pub dgpu_power: Option<f64>,
     pub dgpu_util: Option<u32>,
     pub logo_state: Option<u8>,
+    pub kbd_brightness: Option<u8>,
     pub caps: DeviceCaps,
 }
 
@@ -51,7 +52,7 @@ impl Default for SensorState {
             battery_status: None, battery_power: None, system_power: None,
             cpu_util: None, igpu_power: None, igpu_util: None,
             dgpu_power: None, dgpu_util: None,
-            logo_state: None, caps: DeviceCaps::default(),
+            logo_state: None, kbd_brightness: None, caps: DeviceCaps::default(),
         }
     }
 }
@@ -76,6 +77,7 @@ impl SensorState {
             dgpu_power,
             dgpu_util,
             logo_state: None,
+            kbd_brightness: None,
             caps: DeviceCaps::default(),
         }
     }
@@ -195,6 +197,7 @@ pub fn start_background_polling(
         let mut prev_fan_speed: Option<i32> = None;
         let mut prev_logo_state: Option<u8> = None;
         let mut prev_on_ac: Option<bool> = None;
+        let mut prev_brightness: Option<u8> = None;
         loop {
             let fresh = SensorState::read_fresh();
             let on_ac = fresh.on_ac;
@@ -234,19 +237,28 @@ pub fn start_background_polling(
                 }
             };
 
+            let kbd_brightness = query_daemon(crate::comms::DaemonCommand::GetBrightness { ac: ac_idx })
+                .and_then(|resp| match resp {
+                    crate::comms::DaemonResponse::GetBrightness { result } => Some(result),
+                    _ => None,
+                });
+
             if let Ok(mut s) = state.lock() {
                 let caps = s.caps.clone();
-                *s = SensorState { fan_speed, logo_state, caps, ..fresh };
+                *s = SensorState { fan_speed, logo_state, kbd_brightness, caps, ..fresh };
             }
 
             // Only poke the tray host when something interactive changes — sending an
             // update every poll cycle causes KDE to close/reset the submenu while the
             // user is trying to interact with it. AC transitions count: the per-profile
-            // fan/logo values shown in the menu depend on the active power profile.
-            if fan_speed != prev_fan_speed || logo_state != prev_logo_state || on_ac != prev_on_ac {
+            // fan/logo/brightness values shown in the menu depend on the active power profile.
+            if fan_speed != prev_fan_speed || logo_state != prev_logo_state
+                || on_ac != prev_on_ac || kbd_brightness != prev_brightness
+            {
                 prev_fan_speed = fan_speed;
                 prev_logo_state = logo_state;
                 prev_on_ac = on_ac;
+                prev_brightness = kbd_brightness;
                 on_update();
             }
 
@@ -331,7 +343,8 @@ fn query_daemon(cmd: crate::comms::DaemonCommand) -> Option<crate::comms::Daemon
 fn set_acknowledged(resp: &crate::comms::DaemonResponse) -> bool {
     matches!(resp,
         crate::comms::DaemonResponse::SetFanSpeed { result: true }
-        | crate::comms::DaemonResponse::SetLogoLedState { result: true })
+        | crate::comms::DaemonResponse::SetLogoLedState { result: true }
+        | crate::comms::DaemonResponse::SetBrightness { result: true })
 }
 
 /// Five fan presets derived from the device fan range. RPMs snap to the
@@ -387,6 +400,30 @@ fn logo_label(logo_state: Option<u8>) -> &'static str {
     logo_state
         .and_then(|s| LOGO_LABELS.get(s as usize).copied())
         .unwrap_or("…")
+}
+
+/// Fixed brightness presets (percentage values, 0-100 scale).
+fn brightness_presets() -> [(u8, &'static str); 5] {
+    [(0, "Off"), (25, "Low"), (50, "Medium"), (75, "High"), (100, "Full")]
+}
+
+/// Exact match only — same rule as fan presets.
+fn selected_brightness_index(presets: &[(u8, &str)], current: Option<u8>) -> Option<usize> {
+    let val = current?;
+    presets.iter().position(|(v, _)| *v == val)
+}
+
+/// Preset name on exact match, "XX%" for off-preset, "…" when unknown.
+fn brightness_current_label(
+    presets: &[(u8, &str)],
+    selected: Option<usize>,
+    current: Option<u8>,
+) -> String {
+    match (selected, current) {
+        (Some(i), _) => presets[i].1.to_string(),
+        (None, None) => "…".to_string(),
+        (None, Some(v)) => format!("{}%", v),
+    }
 }
 
 /// One menu status row: "iGPU  54°C · 12%". Returns None when both fields are absent.
@@ -451,6 +488,18 @@ impl ksni::Tray for RazerTray {
         let selected = selected_preset_index(&presets, state.fan_speed);
         let current_label = fan_current_label(&presets, selected, state.fan_speed, fan_min, fan_max);
         let fan_submenu_label = format!("Fan Speed  ·  {}", current_label);
+
+        let bright_presets = brightness_presets();
+        let bright_selected = selected_brightness_index(
+            &bright_presets.map(|(v, l)| (v, l)),
+            state.kbd_brightness,
+        );
+        let bright_label = brightness_current_label(
+            &bright_presets.map(|(v, l)| (v, l)),
+            bright_selected,
+            state.kbd_brightness,
+        );
+        let bright_submenu_label = format!("Brightness  ·  {}", bright_label);
 
         // Status lines
         let cpu_line  = stat_line("CPU",  state.cpu_temp,  state.cpu_util);
@@ -520,6 +569,37 @@ impl ksni::Tray for RazerTray {
                 ..Default::default()
             }),
         ];
+
+        // Keyboard brightness submenu — always shown
+        items.push(ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
+            label: bright_submenu_label,
+            submenu: bright_presets.iter().enumerate().map(|(i, (val, label))| {
+                let val = *val;
+                let display = label.to_string();
+                ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
+                    label: display,
+                    checked: bright_selected == Some(i),
+                    activate: Box::new(move |tray: &mut RazerTray| {
+                        let on_ac = tray.state.lock().ok().and_then(|s| s.on_ac).unwrap_or(true);
+                        let ac = if on_ac { 1 } else { 0 };
+                        let acknowledged = crate::comms::try_bind()
+                            .ok()
+                            .and_then(|socket| crate::comms::send_to_daemon(
+                                crate::comms::DaemonCommand::SetBrightness { ac, val },
+                                socket,
+                            ))
+                            .is_some_and(|resp| set_acknowledged(&resp));
+                        if acknowledged {
+                            if let Ok(mut s) = tray.state.lock() {
+                                s.kbd_brightness = Some(val);
+                            }
+                        }
+                    }),
+                    ..Default::default()
+                })
+            }).collect(),
+            ..Default::default()
+        }));
 
         // Logo submenu — only shown on devices with logo feature
         if has_logo {
@@ -1019,6 +1099,65 @@ mod tests {
             parse_dgpu_stats("65, 35.50, 12\n48, 10.00, 3\n"),
             (Some(65.0), Some(35.5), Some(12))
         );
+    }
+
+    // --- brightness helpers ---
+
+    #[test]
+    fn brightness_presets_has_expected_values() {
+        let p = brightness_presets();
+        assert_eq!(p[0], (0, "Off"));
+        assert_eq!(p[1], (25, "Low"));
+        assert_eq!(p[2], (50, "Medium"));
+        assert_eq!(p[3], (75, "High"));
+        assert_eq!(p[4], (100, "Full"));
+    }
+
+    #[test]
+    fn brightness_selected_index_exact_match() {
+        let p = brightness_presets();
+        let pm: Vec<(u8, &str)> = p.iter().map(|&(v, l)| (v, l)).collect();
+        assert_eq!(selected_brightness_index(&pm, Some(0)), Some(0));
+        assert_eq!(selected_brightness_index(&pm, Some(50)), Some(2));
+        assert_eq!(selected_brightness_index(&pm, Some(100)), Some(4));
+    }
+
+    #[test]
+    fn brightness_selected_index_none_for_off_preset_and_unknown() {
+        let p = brightness_presets();
+        let pm: Vec<(u8, &str)> = p.iter().map(|&(v, l)| (v, l)).collect();
+        assert_eq!(selected_brightness_index(&pm, Some(33)), None);
+        assert_eq!(selected_brightness_index(&pm, None), None);
+    }
+
+    #[test]
+    fn brightness_label_shows_preset_name_on_exact_match() {
+        let p = brightness_presets();
+        let pm: Vec<(u8, &str)> = p.iter().map(|&(v, l)| (v, l)).collect();
+        assert_eq!(brightness_current_label(&pm, Some(2), Some(50)), "Medium");
+        assert_eq!(brightness_current_label(&pm, Some(0), Some(0)), "Off");
+    }
+
+    #[test]
+    fn brightness_label_shows_percent_for_off_preset_value() {
+        let p = brightness_presets();
+        let pm: Vec<(u8, &str)> = p.iter().map(|&(v, l)| (v, l)).collect();
+        assert_eq!(brightness_current_label(&pm, None, Some(33)), "33%");
+        assert_eq!(brightness_current_label(&pm, None, Some(0)), "0%");
+    }
+
+    #[test]
+    fn brightness_label_shows_unknown_marker_when_none() {
+        let p = brightness_presets();
+        let pm: Vec<(u8, &str)> = p.iter().map(|&(v, l)| (v, l)).collect();
+        assert_eq!(brightness_current_label(&pm, None, None), "…");
+    }
+
+    #[test]
+    fn set_brightness_acknowledged_on_true_result() {
+        use crate::comms::DaemonResponse;
+        assert!(set_acknowledged(&DaemonResponse::SetBrightness { result: true }));
+        assert!(!set_acknowledged(&DaemonResponse::SetBrightness { result: false }));
     }
 
     #[test]
